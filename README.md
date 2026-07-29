@@ -1,8 +1,46 @@
 # engram
 
-A single-header C++ library that provides a unified arena-allocation API over a
+A C++20 library that provides a unified arena-allocation API over a
 variety of memory targets — stack, heap, external buffers, and GPU / accelerator
-device memory.
+device memory. It ships in **two interchangeable layouts** — a drop-in single
+header and a header + source (`.h`/`.cpp`) pair — see
+[Choosing a layout](#choosing-a-layout-single-header-vs-header--source).
+
+## TL;DR
+
+Grab one block of memory from wherever you need it — the stack, the heap, a
+buffer you already own, or GPU / accelerator device memory — then `push` objects
+and arrays into it and let the whole thing free at once when the `arena` dies.
+
+```cpp
+#include "engram.h"
+using namespace engram;
+
+auto a = arena::heap(1 << 20, /*trueContiguous*/ false);   // 1 MiB heap arena
+
+auto& n     = a.push<int>(42);              // one object
+auto  data  = a.push_array<float>(1024);    // std::span<float>, 1024 elts
+auto  hello = a.push_string("hi");          // std::string_view
+
+// ...use them...
+
+a.pop_string(hello);                        // LIFO unwind (or just let `a` die)
+```
+
+With `engram` you can:
+
+- **Bump-allocate** objects, arrays, and strings into a single owned block, with
+  optional LIFO `pop`, and hand results back as `std::span` / `std::string_view`.
+- **Target many memory sources** through one API: stack (`alloca` with heap
+  fallback), heap (aligned / page-aligned / huge-page / shared), an
+  **external** buffer you already own, or a **custom** backend.
+- **Allocate device / accelerator memory** — Vulkan, DirectX 12, Metal, CUDA,
+  ROCm, OpenCL, SYCL, Level Zero, WebGPU, XDNA, DPDK, OP-TEE, PMDK, RDMA, and
+  GPUDirect — behind the exact same `push`/`pop` interface.
+- **Drop into standard code** via a `std::pmr::monotonic_buffer_resource` view,
+  **prefetch / warm** ranges into cache or device, and pin pages into RAM.
+
+See the [Overview](#overview) for the full story.
 
 ## Overview
 
@@ -12,15 +50,40 @@ scattering `new`/`delete`, `alloca`, `cudaMalloc`, and friends throughout your
 code, you create an `arena` for the target you want and then `push` objects and
 arrays into it. The arena reclaims everything when it is destroyed.
 
-Everything lives in a single header, inside the `engram` namespace:
+Everything is exposed through the `engram` namespace. Both layouts present the
+identical `arena` API, so the include is all that differs:
 
 ```cpp
-#include "engram.h"
+#include "engram.h"     // single_header/engram.h  — or  src/engram.h
 using namespace engram;
 ```
 
 `engram` requires **C++20** (it uses `std::span`, `if constexpr`, fold
 expressions, and `std::align_val_t`).
+
+## Choosing a layout: single header vs. header + source
+
+engram is distributed in two forms that share the same `engram::arena` API:
+
+|                     | **Single header** (`single_header/engram.h`)                     | **Header + source** (`src/engram.h` + `src/engram.cpp`)                              |
+| ------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Integration         | Copy one header and `#include` it — no build step                | Add `engram.h` to your includes **and** compile/link `engram.cpp`                   |
+| Vendor SDK headers  | Pulled into **every** TU that enables a backend                  | Confined to `engram.cpp`; users of `engram.h` need no vendor SDK on their include path |
+| Compile time        | Every including TU recompiles the whole implementation           | Implementation compiled once; consuming TUs stay lightweight                        |
+| Encapsulation       | Internals visible in the header                                  | Internals hidden behind the opaque pointer; changing them doesn't force a rebuild    |
+| Runtime cost        | State stored inline in `arena` — no indirection, no extra alloc  | One heap allocation for `impl_data` per arena + a pointer hop to reach state         |
+| Creation API        | Typed `arena::create_vulkan/_dx12/…` factories **and** `create_custom` | Single `arena::create_custom(size, custom, flags, …)` enum dispatch            |
+
+**Use the single header** for quick integration, small projects, or when you want
+zero build configuration and don't mind the extra per-TU compile cost.
+
+**Use the header + source** for larger codebases: faster incremental builds, a
+clean public header that doesn't drag vendor SDK headers (CUDA, Vulkan, DX12, …)
+into your translation units, and the freedom to change the implementation without
+recompiling everything that includes it.
+
+The bundled CMake exposes `ENGRAM_SINGLE_HEADER` (default `ON`) to switch between
+them — see [Building](#building).
 
 ## Memory Targets
 
@@ -420,10 +483,19 @@ includes `<cuda_runtime.h>` unconditionally.)
 
 ## Building
 
-`engram` is header-only — just add the header to your include path. Enable any
-optional backends by defining the relevant `ENGRAM_ENABLE_*` macro and linking
-against that backend's SDK (CUDA, HIP, Vulkan, OpenCL, SYCL, Level Zero, WebGPU,
-DPDK, PMDK `libpmem`, RDMA `libibverbs`, GPUDirect `cufile`, etc.).
+Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-header--source)):
+
+- **Single header** — add `single_header/engram.h` to your include path and
+  `#include` it. No build step.
+- **Header + source** — add `src/` to your includes and compile `src/engram.cpp`
+  into your target (or link the library the bundled `CMakeLists.txt` builds).
+
+The provided `CMakeLists.txt` exposes `ENGRAM_SINGLE_HEADER` (default `ON`) to
+switch between the two, plus an `ENGRAM_ENABLE_*` option per backend. Either way,
+enable optional backends by defining the relevant `ENGRAM_ENABLE_*` macro and
+linking against that backend's SDK (CUDA, HIP, Vulkan, OpenCL, SYCL, Level Zero,
+WebGPU, DPDK, PMDK `libpmem`, RDMA `libibverbs`, GPUDirect `cufile`, etc.). For
+the header + source layout, define those macros for the `engram.cpp` build too.
 
 On Apple platforms, link the `Metal`, `Foundation`, and `QuartzCore` frameworks.
 When using metal-cpp (`ENGRAM_METAL_CPP`), define `ENGRAM_METAL_PRIVATE_IMPL` in
@@ -462,6 +534,52 @@ reserved (e.g. `vm.nr_hugepages`) and does not need a policy change.
 (Linux). On Linux this is bounded by the `RLIMIT_MEMLOCK` ulimit; on Windows it
 counts against the process working-set minimum. Call `arena::unpin()` to release
 the lock.
+
+## Python bindings
+
+A [pybind11](https://github.com/pybind/pybind11) wrapper for engram's public
+`arena` API lives in [`bindings/python`](bindings/python). Because the C++
+`push`/`pop` helpers are templates, they are surfaced as byte-oriented operations
+that return `memoryview`s aliasing the arena's storage.
+
+Build and install (needs a C++20 compiler; `pip` pulls in pybind11 and
+scikit-build-core):
+
+```bash
+cd bindings/python
+pip install .
+```
+
+```python
+import engram
+
+a = engram.Arena.heap(1 << 20)                  # 1 MiB heap arena
+
+mv = a.alloc(1024)                              # writable memoryview (1024 bytes)
+mv[:5] = b"hello"
+a.push_bytes(b"world")                          # copy a bytes-like object in
+s = a.push_str("greetings")                     # NUL-terminated string
+
+print(a.used, a.capacity, a.remaining, a.source)
+
+# adopt a buffer you already own (the arena will not free it)
+buf = bytearray(4096)
+b = engram.Arena.adopt(buf, engram.Flag.COMMIT)
+
+# cache / page warm-up helpers work on any buffer
+engram.warm_cache(mv, engram.CacheLocality.L1, engram.IO.READ)
+engram.prefetch(buf)
+```
+
+What's exposed: the `Arena` factories (`create`, `stack`, `heap`, `adopt`),
+byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`), introspection
+(`used`, `capacity`, `remaining`, `count`, `total`, `source`, `is_valid`,
+`empty`), `prefetch` / `warm_cache` / `sync` / `unpin`, the `MemorySource`,
+`CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
+
+Device/accelerator backends (CUDA, Vulkan, DirectX 12, …) are **not** exposed to
+Python — they need native device handles; use the C++ API for those. Returned
+`memoryview`s stay valid only until you `pop` past them or drop the arena.
 
 ## License
 
