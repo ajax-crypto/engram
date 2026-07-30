@@ -142,7 +142,9 @@ The variadic arguments after `flags` depend on the selected `custom` backend:
 | `PMDK`                      | `const char* path, int pmdk_flags, mode_t mode`                                           |
 | `RDMA`                      | `void* buffer, ibv_pd*, int access`                                                       |
 | `OpTee`                     | `uint32_t hint`                                                                           |
-| `Metal`                     | `MTL::Device*` (or an Objective-C `id` device)                                            || `DmaBuf`                    | `int deviceFd` (Linux; `deviceFd < 0` opens `/dev/dma_heap/system`)                        |
+| `Metal`                     | `MTL::Device*` (or an Objective-C `id` device)                                            |
+| `DmaBuf`                    | `int deviceFd` (Linux; `deviceFd < 0` opens `/dev/dma_heap/system`)                        |
+
 The optional `alignment` argument on `create`/`heap` controls the alignment of
 the underlying heap allocation (via aligned `operator new`). When
 `flags::page_aligned` is set, the effective alignment is raised to the page size
