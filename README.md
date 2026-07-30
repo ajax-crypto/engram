@@ -35,8 +35,8 @@ With `engram` you can:
   fallback), heap (aligned / page-aligned / huge-page / shared), an
   **external** buffer you already own, or a **custom** backend.
 - **Allocate device / accelerator memory** — Vulkan, DirectX 12, Metal, CUDA,
-  ROCm, OpenCL, SYCL, Level Zero, WebGPU, XDNA, DPDK, OP-TEE, PMDK, RDMA, and
-  GPUDirect — behind the exact same `push`/`pop` interface.
+  ROCm, OpenCL, SYCL, Level Zero, WebGPU, XDNA, DPDK, OP-TEE, PMDK, RDMA,
+  GPUDirect, and Linux dma-buf — behind the exact same `push`/`pop` interface.
 - **Drop into standard code** via a `std::pmr::monotonic_buffer_resource` view,
   **prefetch / warm** ranges into cache or device, and pin pages into RAM.
 
@@ -100,8 +100,8 @@ Optional accelerator/device backends are compiled in via preprocessor switches
 (see [Optional Backends](#optional-backends)):
 Vulkan, DirectX 12, Metal, CUDA, ROCm/HIP, OpenCL, SYCL, oneAPI Level Zero,
 WebGPU, XDNA (AMD AIE), DPDK, OP-TEE (ARM TrustZone), PMDK (persistent memory),
-RDMA, and CUDA GPUDirect Storage. Their implementations live in the nested
-`engram::vendor` namespace.
+RDMA, CUDA GPUDirect Storage, and Linux dma-buf heaps. Their implementations live
+in the nested `engram::vendor` namespace.
 
 ## Creating an Arena
 
@@ -121,12 +121,28 @@ arena arena::heap(std::size_t size, bool trueContiguous,
 template <typename T>
 arena arena::adopt(T* storage, std::size_t size, int32_t flags = 0);
 
-// Provide your own allocation function; the first argument must be a pointer
-// to a function taking (arena&, ...).
-template <typename... ArgsT>
-arena arena::create_custom(std::size_t size, ArgsT&&... args);
+// Select a vendor/device backend with the `custom` enum; backend-specific
+// parameters follow `flags` as variadic arguments (see the table below).
+arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...);
 ```
 
+The variadic arguments after `flags` depend on the selected `custom` backend:
+
+| `custom` backend            | Variadic parameters after `flags`                                                        |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| `CUDA`, `ROCm`, `GPUDirect` | *(none)*                                                                                  |
+| `Vulkan`                    | `VkDevice, VkPhysicalDevice, const VkAllocationCallbacks*, VkDeviceSize offset, VkMemoryMapFlags` |
+| `DX12`                      | `ID3D12Device*, D3D12_RESOURCE_FLAGS, D3D12_RESOURCE_STATES`                              |
+| `OpenCL`                    | `cl_context, cl_svm_mem_flags, cl_uint alignment`                                        |
+| `SYCL`                      | `sycl::queue*`                                                                            |
+| `LevelZero`                 | `ze_context_handle_t, ze_device_handle_t`                                                 |
+| `WebGPU`                    | `WGPUDevice`                                                                              |
+| `XDNA`                      | `xrtDeviceHandle, xrtBufferFlags, xrtMemoryGroup`                                         |
+| `DPDK`                      | `const char* name, int align, int socketId, unsigned int dpdkFlags, int useVirtAddr`     |
+| `PMDK`                      | `const char* path, int pmdk_flags, mode_t mode`                                           |
+| `RDMA`                      | `void* buffer, ibv_pd*, int access`                                                       |
+| `OpTee`                     | `uint32_t hint`                                                                           |
+| `Metal`                     | `MTL::Device*` (or an Objective-C `id` device)                                            || `DmaBuf`                    | `int deviceFd` (Linux; `deviceFd < 0` opens `/dev/dma_heap/system`)                        |
 The optional `alignment` argument on `create`/`heap` controls the alignment of
 the underlying heap allocation (via aligned `operator new`). When
 `flags::page_aligned` is set, the effective alignment is raised to the page size
@@ -214,11 +230,53 @@ a.remaining();  // bytes still free
 a.count();      // live allocation count
 a.total();      // lifetime allocation count
 a.source();     // the memory_source backing this arena
+a.data();       // std::span<std::byte> over the whole storage [base, capacity)
 a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 ```
 
 `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
+
+### Partitioning (sub-arenas)
+
+`partition(start, size, flags)` carves a fixed region of an arena into an
+independent **sub-arena** you can hand to a child function or worker thread. The
+sub-arena is a non-owning `memory_source::external` view of `[start, start +
+size)`; destroying it leaves the parent (and its memory) untouched, so no extra
+allocation or ownership transfer is involved. The region is zeroed by default;
+pass `flags::no_clear` to skip that. You pick the (non-overlapping) regions.
+
+```cpp
+auto pool = arena::heap(4 << 20);              // 4 MiB backing block
+
+// Split the pool into per-worker slices and run them in parallel.
+constexpr std::size_t workers = 4;
+const std::size_t slice = pool.capacity() / workers;
+
+std::vector<std::thread> threads;
+for (std::size_t i = 0; i < workers; ++i)
+{
+    engram::arena sub = pool.partition(i * slice, slice);   // slice is zeroed
+    threads.emplace_back([sub = std::move(sub)]() mutable {
+        auto scratch = sub.push_array<float>(256);   // each thread bump-allocates
+        // ... work only within this thread's slice ...
+    });
+}
+for (auto& t : threads) t.join();
+```
+
+Because each sub-arena owns a disjoint region, the threads never touch the same
+bytes and need no locking. The same pattern hands a scratch slice to a callee:
+
+```cpp
+void render(engram::arena scratch);            // takes its own sub-arena
+
+auto frame = arena::heap(1 << 20);
+render(frame.partition(0, 64 * 1024));         // give the callee a 64 KiB slice
+```
+
+> The parent arena must outlive every sub-arena carved from it, since the
+> sub-arena points into the parent's memory.
 
 ### PMR Integration
 
@@ -233,7 +291,7 @@ std::pmr::vector<int> v{ &a.get_pmr_resource() };
 auto& r = a.get_pmr_resource(/*start=*/0, /*size=*/4096);
 ```
 
-### Device Synchronization & Prefetch
+### Synchronization & Prefetch
 
 Device-backed arenas expose two C-style variadic helpers, `sync(...)` and
 `prefetch(...)`, that both return `bool` (`true` on success). They dispatch on
@@ -319,22 +377,23 @@ available on the current platform). DirectX 12 is enabled automatically on
 Windows (`_WIN32`), and Metal on Apple platforms (`__APPLE__`) — see
 [Metal (Apple)](#metal-apple) below.
 
-| Macro                    | Backend                | Factory                |
-| ------------------------ | ---------------------- | ---------------------- |
-| `ENGRAM_ENABLE_VULKAN`   | Vulkan device memory   | `arena::create_vulkan` |
-| `ENGRAM_ENABLE_DX12`     | DirectX 12 (Windows)   | `arena::create_dx12`   |
-| `ENGRAM_ENABLE_CUDA`     | NVIDIA CUDA            | `arena::create_cuda`   |
-| `ENGRAM_ENABLE_ROCM`     | AMD ROCm / HIP         | `arena::create_rocm`   |
-| `ENGRAM_ENABLE_OPENCL`   | OpenCL SVM             | `arena::create_opencl` |
-| `ENGRAM_ENABLE_SYCL`     | SYCL USM (shared)      | `arena::create_sycl`   |
-| `ENGRAM_ENABLE_LEVEL_ZERO`| oneAPI Level Zero USM | `arena::create_level_zero` |
-| `ENGRAM_ENABLE_WEBGPU`   | WebGPU mapped buffer   | `arena::create_webgpu` |
-| `ENGRAM_ENABLE_XDNA`     | AMD XDNA (XRT)         | `arena::create_xdna`   |
-| `ENGRAM_ENABLE_DPDK`     | DPDK memory zones      | `arena::create_dpdk`   |
-| `ENGRAM_ENABLE_OP_TEE`   | OP-TEE / ARM TrustZone | `arena::create_op_tee` |
-| `ENGRAM_ENABLE_PMDK`     | PMDK persistent memory | `arena::create_pmdk`   |
-| `ENGRAM_ENABLE_RDMA`     | RDMA-registered memory | `arena::create_rdma`   |
-| `ENGRAM_ENABLE_GPUDIRECT`| CUDA GPUDirect Storage | `arena::create_gpudirect` |
+| Macro                    | Backend                | 
+| ------------------------ | ---------------------- |
+| `ENGRAM_ENABLE_VULKAN`   | Vulkan device memory   |
+| `ENGRAM_ENABLE_DX12`     | DirectX 12 (Windows)   |
+| `ENGRAM_ENABLE_CUDA`     | NVIDIA CUDA            |
+| `ENGRAM_ENABLE_ROCM`     | AMD ROCm / HIP         |
+| `ENGRAM_ENABLE_OPENCL`   | OpenCL SVM             |
+| `ENGRAM_ENABLE_SYCL`     | SYCL USM (shared)      |
+| `ENGRAM_ENABLE_LEVEL_ZERO`| oneAPI Level Zero USM |
+| `ENGRAM_ENABLE_WEBGPU`   | WebGPU mapped buffer   |
+| `ENGRAM_ENABLE_XDNA`     | AMD XDNA (XRT)         |
+| `ENGRAM_ENABLE_DPDK`     | DPDK memory zones      |
+| `ENGRAM_ENABLE_OP_TEE`   | OP-TEE / ARM TrustZone |
+| `ENGRAM_ENABLE_PMDK`     | PMDK persistent memory | 
+| `ENGRAM_ENABLE_RDMA`     | RDMA-registered memory |
+| `ENGRAM_ENABLE_GPUDIRECT`| CUDA GPUDirect Storage |
+| `ENGRAM_ENABLE_DMABUF`   | Linux dma-buf heap     |
 
 Example:
 
@@ -455,6 +514,26 @@ g.sync();                                     // cudaDeviceSynchronize
 
 This backend pulls in both `<cuda_runtime.h>` and `<cufile.h>`.
 
+### Linux dma-buf
+
+Enable `ENGRAM_ENABLE_DMABUF` (Linux only) to allocate a dma-buf from a kernel
+dma-buf heap. engram issues `DMA_HEAP_IOCTL_ALLOC` on the heap device to obtain a
+dma-buf fd, then `mmap`s it to get the CPU pointer:
+
+```cpp
+auto a = arena::create_dmabuf(1 << 20);           // opens /dev/dma_heap/system
+std::span<float> data = a.push_array<float>(1024);
+
+int heap_fd = open("/dev/dma_heap/cma", O_RDWR | O_CLOEXEC);
+auto b = arena::create_dmabuf(1 << 20, heap_fd);  // use a caller-supplied heap fd
+```
+
+Signature: `create_dmabuf(size, int deviceFd = -1, flags)`. When `deviceFd` is
+negative engram opens `/dev/dma_heap/system` (and closes it after the allocation);
+otherwise the caller-supplied heap fd is used and left open. On destruction the
+arena unmaps the buffer and closes the dma-buf fd. This backend pulls in
+`<linux/dma-heap.h>`, `<sys/ioctl.h>`, and `<fcntl.h>`.
+
 ### Overriding Backend Headers
 
 Each backend includes its SDK header by default, but you can point it at a custom
@@ -477,6 +556,7 @@ path by defining the matching macro before including `engram.h`:
 | `ENGRAM_PMDK_HEADER`        | `<libpmem.h>`                     |
 | `ENGRAM_RDMA_HEADER`        | `<infiniband/verbs.h>`            |
 | `ENGRAM_GPUDIRECT_HEADER`   | `<cufile.h>`                      |
+| `ENGRAM_DMABUF_HEADER`      | `<linux/dma-heap.h>`              |
 
 (DirectX 12 uses fixed system headers and is not overridable. GPUDirect also
 includes `<cuda_runtime.h>` unconditionally.)
@@ -572,8 +652,9 @@ engram.prefetch(buf)
 ```
 
 What's exposed: the `Arena` factories (`create`, `stack`, `heap`, `adopt`),
-byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`), introspection
-(`used`, `capacity`, `remaining`, `count`, `total`, `source`, `is_valid`,
+byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`, `partition`),
+introspection
+(`used`, `capacity`, `remaining`, `count`, `total`, `source`, `data`, `is_valid`,
 `empty`), `prefetch` / `warm_cache` / `sync` / `unpin`, the `MemorySource`,
 `CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
 

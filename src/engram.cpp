@@ -4,6 +4,13 @@
 
 #include "engram.h"
 
+#include <cstdarg>
+#include <tuple>
+
+#ifndef ENGRAM_DISABLE_PMR
+#include <optional>
+#endif
+
 #include <tuple>
 #include <unordered_map>
 
@@ -131,6 +138,16 @@
 #include <cufile.h>
 #else
 #include ENGRAM_GPUDIRECT_HEADER
+#endif
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#ifndef ENGRAM_DMABUF_HEADER
+#include <linux/dma-heap.h>
+#else
+#include ENGRAM_DMABUF_HEADER
 #endif
 #endif
 
@@ -353,6 +370,13 @@ static ibv_mr* get_rdma_mr(impl_data& arena);
 #ifdef ENGRAM_ENABLE_GPUDIRECT
 static void free_gpudirect(impl_data& arena);
 static void allocate_gpudirect(impl_data& arena, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+inline static std::unordered_map<std::byte*, int> dmabuf_fd_map;   // ptr -> dma-buf fd
+
+static void free_dmabuf(impl_data& arena);
+static void allocate_dmabuf(impl_data& arena, int deviceFd, int32_t flags);
 #endif
 
 } // namespace vendor
@@ -674,7 +698,18 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
 }
 
 #ifdef __linux__
-arena arena::heap(std::size_t size, std::string_view name, std::size_t alignment)
+arena arena::heap(std::size_t size, std::string_view name, bool trueContiguous, std::size_t alignment, int fd)
+{
+    auto result = create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : 
+        engram::flags::page_aligned, alignment, fd);
+    if (result.m_impl->m_ptr)
+    {
+        prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, result.m_impl->m_ptr, size, name.data());
+    }
+    return result;
+}
+
+arena arena::heapfile(std::size_t size, std::string_view name, std::size_t alignment)
 {
     auto fd = memfd_create(name.data(), MFD_CLOEXEC);
     if (fd != -1) 
@@ -835,6 +870,14 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
             vendor::allocate_gpudirect(d, flags);
             break;
 #endif
+#ifdef ENGRAM_ENABLE_DMABUF
+        case custom::DmaBuf:
+        {
+            auto deviceFd = va_arg(args, int);
+            vendor::allocate_dmabuf(d, deviceFd, flags);
+            break;
+        }
+#endif
         default: break;
     }
 
@@ -921,6 +964,19 @@ std::size_t arena::remaining() const { return m_impl->m_size - m_impl->m_offset;
 std::size_t arena::count() const { return m_impl->m_count; }
 std::size_t arena::total() const { return m_impl->m_total; }
 memory_source arena::source() const { return m_impl->m_type; }
+
+std::span<std::byte> arena::data() const
+{
+    auto& d = *m_impl;
+    return d.m_ptr ? std::span<std::byte>{ d.m_ptr, d.m_size } : std::span<std::byte>{};
+}
+
+arena arena::partition(std::size_t start, std::size_t size, int32_t flags)
+{
+    auto& d = *m_impl;
+    assert((start + size) <= d.m_size);
+    return make_external(d.m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit);
+}
 
 arena::~arena()
 {
@@ -1952,6 +2008,69 @@ void allocate_gpudirect(impl_data& arena, int32_t flags)
         arena.m_ptr = nullptr;
 
     handle_heap_fallback(arena, flags);
+}
+
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+
+void free_dmabuf(impl_data& arena)
+{
+    if (arena.m_ptr)
+        if (arena.m_type == memory_source::custom)
+        {
+            auto it = dmabuf_fd_map.find(arena.m_ptr);
+            if (it != dmabuf_fd_map.end())
+            {
+                munmap(arena.m_ptr, arena.m_size);
+                close(it->second);
+                dmabuf_fd_map.erase(it);
+            }
+        }
+        else
+            heap_free(arena);
+}
+
+void allocate_dmabuf(impl_data& arena, int deviceFd, int32_t flags)
+{
+    // A negative device fd means "use the default system dma-buf heap".
+    bool ownsHeap = deviceFd < 0;
+    int heapFd = ownsHeap ? open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC) : deviceFd;
+    if (heapFd < 0)
+    {
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    dma_heap_allocation_data alloc = {};
+    alloc.len = arena.m_size;
+    alloc.fd_flags = O_RDWR | O_CLOEXEC;
+
+    int rc = ioctl(heapFd, DMA_HEAP_IOCTL_ALLOC, &alloc);
+    if (ownsHeap)
+        close(heapFd);
+    if (rc != 0)
+    {
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    void* p = mmap(nullptr, arena.m_size, PROT_READ | PROT_WRITE, MAP_SHARED, alloc.fd, 0);
+    if (p == MAP_FAILED)
+    {
+        close(alloc.fd);
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    arena.m_ptr = (std::byte*)p;
+    arena.m_extra = &free_dmabuf;
+    arena.m_use_sys_free = true;
+    arena.m_type = memory_source::custom;
+    dmabuf_fd_map.emplace(arena.m_ptr, alloc.fd);
+
+    if (flags & engram::flags::commit)
+        std::memset(arena.m_ptr, 0, arena.m_size);
 }
 
 #endif

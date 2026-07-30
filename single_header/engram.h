@@ -59,6 +59,7 @@
 #define ENGRAM_ENABLE_DPDK
 #define ENGRAM_ENABLE_RDMA
 #define ENGRAM_ENABLE_GPUDIRECT
+#define ENGRAM_ENABLE_DMABUF
 #endif
 #endif
 
@@ -192,6 +193,16 @@
 #include <cufile.h>
 #else
 #include ENGRAM_GPUDIRECT_HEADER
+#endif
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#ifndef ENGRAM_DMABUF_HEADER
+#include <linux/dma-heap.h>
+#else
+#include ENGRAM_DMABUF_HEADER
 #endif
 #endif
 
@@ -375,6 +386,13 @@ ibv_mr* get_rdma_mr(arena& arena);
 #ifdef ENGRAM_ENABLE_GPUDIRECT
 void free_gpudirect(arena& arena);
 void allocate_gpudirect(arena& arena, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+inline static std::unordered_map<std::byte*, int> dmabuf_fd_map;   // ptr -> dma-buf fd
+
+void free_dmabuf(arena& arena);
+void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags);
 #endif
 
 } // namespace vendor
@@ -588,7 +606,7 @@ enum class cache_locality
 };
 
 /** @brief Vendor backend selector for @ref arena::create_custom. */
-enum class custom { CUDA, ROCm, Vulkan, DX12, OpenCL, SYCL, LevelZero, WebGPU, DPDK, RDMA, GPUDirect, XDNA, PMDK, Metal, OpTee };
+enum class custom { CUDA, ROCm, Vulkan, DX12, OpenCL, SYCL, LevelZero, WebGPU, DPDK, RDMA, GPUDirect, XDNA, PMDK, Metal, OpTee, DmaBuf };
 
 /** @brief Bit flags controlling allocation behaviour and cache-warm intent. */
 namespace flags 
@@ -821,14 +839,33 @@ public:
      * @param alignment      Minimum alignment.
      * @param fd             Optional file descriptor for a file-backed mapping.
      */
-    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
+    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
     {
         return create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : engram::flags::page_aligned, alignment, fd);
     }
 
 #ifdef __linux__
+    /**
+     * @brief Create a heap arena (page-aligned; optionally physically contiguous).
+     * @param size           Capacity in bytes.
+     * @param name           Named virtual memory area, Check /proc/%d/maps.
+     * @param trueContiguous Request contiguous / huge-page memory.
+     * @param alignment      Minimum alignment.
+     * @param fd             Optional file descriptor for a file-backed mapping.
+     */
+    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1);
+    {
+        auto result = create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : 
+        engram::flags::page_aligned, alignment, fd);
+        if (result.m_impl->m_ptr)
+        {
+            prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, result.m_impl->m_ptr, size, name.data());
+        }
+        return result;
+    }
+
     /** @brief Create a heap arena backed by an anonymous `memfd` named @p name (Linux only). */
-    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t))
+    [[nodiscard]] static arena heapfile(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t))
     {
         auto fd = memfd_create(name.data(), MFD_CLOEXEC);
         if (fd != -1) 
@@ -908,6 +945,7 @@ public:
      *   - RDMA     : `(..., void* buffer, ibv_pd*, int access)`
      *   - OpTee    : `(..., uint32_t hint)`
      *   - Metal    : `(..., MTL::Device* | id device)`
+     *   - DmaBuf   : `(..., int deviceFd)` (Linux; deviceFd < 0 opens "/dev/dma_heap/system")
      *
      * @param size  Capacity in bytes.
      * @param type  Backend selector.
@@ -1058,6 +1096,14 @@ public:
                 vendor::allocate_gpudirect(result, flags);
                 break;
 #endif
+#ifdef ENGRAM_ENABLE_DMABUF
+            case custom::DmaBuf:
+            {
+                auto deviceFd = va_arg(args, int);
+                vendor::allocate_dmabuf(result, deviceFd, flags);
+                break;
+            }
+#endif
             default: break;
         }
 
@@ -1193,6 +1239,17 @@ public:
     [[nodiscard]] static arena create_gpudirect(std::size_t size, int32_t flags = 0)
     {
         return create_custom(size, &vendor::allocate_gpudirect, flags);
+    }
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+    /**
+     * @brief Create an arena over a Linux dma-buf heap allocation (`DMA_HEAP_IOCTL_ALLOC` + `mmap`).
+     * @param deviceFd Open dma-buf heap fd; when negative, `/dev/dma_heap/system` is opened instead.
+     */
+    [[nodiscard]] static arena create_dmabuf(std::size_t size, int deviceFd = -1, int32_t flags = 0)
+    {
+        return create_custom(size, &vendor::allocate_dmabuf, deviceFd, flags);
     }
 #endif
 
@@ -1774,6 +1831,36 @@ public:
     std::size_t count() const { return m_count; }        ///< @return Live array/string allocation count.
     std::size_t total() const { return m_total; }        ///< @return Lifetime array/string allocation count.
     memory_source source() const { return m_type; }      ///< @return The arena's @ref memory_source.
+
+    /**
+     * @brief Access the arena's underlying storage as a contiguous byte range.
+     * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
+     *         or an empty span if the arena holds no storage.
+     */
+    std::span<std::byte> data() const
+    {
+        return m_ptr ? std::span<std::byte>{ m_ptr, m_size } : std::span<std::byte>{};
+    }
+
+    /**
+     * @brief Carve out a sub-arena over a fixed region of this arena's storage.
+     *
+     * @details The returned arena is a @ref memory_source::external view of
+     * `[start, start + size)` within this arena; it does **not** own the memory, so
+     * destroying it leaves the parent untouched. This lets you hand an independent
+     * slice to a child function or a worker thread with no extra allocation. The
+     * caller is responsible for choosing non-overlapping regions.
+     * @param start Byte offset of the region within this arena.
+     * @param size  Size of the region in bytes.
+     * @param flags @ref flags controlling initialisation: the region is zeroed by
+     *              default (and with `commit`); pass `no_clear` to skip zeroing.
+     * @return A sub-arena bound to `[start, start + size)`.
+     */
+    [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0)
+    {
+        assert((start + size) <= m_size);
+        return adopt(m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit);
+    }
 };
 
 static void handle_heap_fallback(arena& arena, int32_t flags)
@@ -2541,6 +2628,69 @@ void allocate_gpudirect(arena& arena, int32_t flags)
         arena.m_ptr = nullptr;
 
     handle_heap_fallback(arena, flags);
+}
+
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+
+void free_dmabuf(arena& arena)
+{
+    if (arena.m_ptr)
+        if (arena.m_type == memory_source::custom)
+        {
+            auto it = dmabuf_fd_map.find(arena.m_ptr);
+            if (it != dmabuf_fd_map.end())
+            {
+                munmap(arena.m_ptr, arena.m_size);
+                close(it->second);
+                dmabuf_fd_map.erase(it);
+            }
+        }
+        else
+            heap_free(arena);
+}
+
+void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
+{
+    // A negative device fd means "use the default system dma-buf heap".
+    bool ownsHeap = deviceFd < 0;
+    int heapFd = ownsHeap ? open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC) : deviceFd;
+    if (heapFd < 0)
+    {
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    dma_heap_allocation_data alloc = {};
+    alloc.len = arena.m_size;
+    alloc.fd_flags = O_RDWR | O_CLOEXEC;
+
+    int rc = ioctl(heapFd, DMA_HEAP_IOCTL_ALLOC, &alloc);
+    if (ownsHeap)
+        close(heapFd);
+    if (rc != 0)
+    {
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    void* p = mmap(nullptr, arena.m_size, PROT_READ | PROT_WRITE, MAP_SHARED, alloc.fd, 0);
+    if (p == MAP_FAILED)
+    {
+        close(alloc.fd);
+        arena.m_ptr = nullptr;
+        return;
+    }
+
+    arena.m_ptr = (std::byte*)p;
+    arena.m_extra = &free_dmabuf;
+    arena.m_use_sys_free = true;
+    arena.m_type = memory_source::custom;
+    dmabuf_fd_map.emplace(arena.m_ptr, alloc.fd);
+
+    if (flags & engram::flags::commit)
+        std::memset(arena.m_ptr, 0, arena.m_size);
 }
 
 #endif

@@ -36,6 +36,7 @@ option(ENGRAM_ENABLE_PMDK       "Enable the PMDK persistent-memory backend."    
 option(ENGRAM_ENABLE_DPDK       "Enable the DPDK backend (Linux only)."              OFF)
 option(ENGRAM_ENABLE_RDMA       "Enable the RDMA/ibverbs backend (Linux only)."      OFF)
 option(ENGRAM_ENABLE_GPUDIRECT  "Enable the GPUDirect Storage backend (Linux only)." OFF)
+option(ENGRAM_ENABLE_DMABUF     "Enable the dma-buf heap backend (Linux only)."      OFF)
 
 # ---------------------------------------------------------------------------
 # Collect the resulting preprocessor definitions
@@ -54,7 +55,7 @@ endif()
 
 foreach(backend
         VULKAN DX12 CUDA ROCM XDNA OPENCL SYCL
-        LEVEL_ZERO WEBGPU PMDK DPDK RDMA GPUDIRECT)
+        LEVEL_ZERO WEBGPU PMDK DPDK RDMA GPUDIRECT DMABUF)
     if(ENGRAM_ENABLE_${backend})
         list(APPEND ENGRAM_DEFINITIONS ENGRAM_ENABLE_${backend})
     endif()

@@ -9,18 +9,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <tuple>
 #include <utility>
 #include <type_traits>
 #include <span>
 #include <string_view>
 #include <new>
-#include <cstdarg>
 #include <stdlib.h>
 #include <assert.h>
 
 #ifndef ENGRAM_DISABLE_PMR
-#include <optional>
 #include <memory_resource>
 #endif
 
@@ -54,6 +51,7 @@
 #define ENGRAM_ENABLE_DPDK
 #define ENGRAM_ENABLE_RDMA
 #define ENGRAM_ENABLE_GPUDIRECT
+#define ENGRAM_ENABLE_DMABUF
 #endif
 #endif
 
@@ -87,7 +85,7 @@ enum class cache_locality
 };
 
 /** @brief Vendor backend selector for @ref arena::create_custom. */
-enum class custom { CUDA, ROCm, Vulkan, DX12, OpenCL, SYCL, LevelZero, WebGPU, DPDK, RDMA, GPUDirect, XDNA, PMDK, Metal, OpTee };
+enum class custom { CUDA, ROCm, Vulkan, DX12, OpenCL, SYCL, LevelZero, WebGPU, DPDK, RDMA, GPUDirect, XDNA, PMDK, Metal, OpTee, DmaBuf };
 
 /** @brief Bit flags controlling allocation behaviour and cache-warm intent. */
 namespace flags 
@@ -228,14 +226,24 @@ public:
      * @param alignment      Minimum alignment.
      * @param fd             Optional file descriptor for a file-backed mapping.
      */
-    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
+    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
     {
         return create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : engram::flags::page_aligned, alignment, fd);
     }
 
 #ifdef __linux__
+    /**
+     * @brief Create a heap arena (page-aligned; optionally physically contiguous).
+     * @param size           Capacity in bytes.
+     * @param name           Named virtual memory area, Check /proc/%d/maps.
+     * @param trueContiguous Request contiguous / huge-page memory.
+     * @param alignment      Minimum alignment.
+     * @param fd             Optional file descriptor for a file-backed mapping.
+     */
+    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1);
+
     /** @brief Create a heap arena backed by an anonymous `memfd` named @p name (Linux only). */
-    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t));
+    [[nodiscard]] static arena heapfile(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t));
 #endif
 
     /**
@@ -278,6 +286,7 @@ public:
      *   - RDMA     : `(..., void* buffer, ibv_pd*, int access)`
      *   - OpTee    : `(..., uint32_t hint)`
      *   - Metal    : `(..., MTL::Device* | id device)`
+     *   - DmaBuf   : `(..., int deviceFd)` (Linux; deviceFd < 0 opens "/dev/dma_heap/system")
      *
      * @param size  Capacity in bytes.
      * @param type  Backend selector.
@@ -530,6 +539,29 @@ public:
     std::size_t count() const;             ///< @return Live array/string allocation count.
     std::size_t total() const;             ///< @return Lifetime array/string allocation count.
     memory_source source() const;          ///< @return The arena's @ref memory_source.
+
+    /**
+     * @brief Access the arena's underlying storage as a contiguous byte range.
+     * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
+     *         or an empty span if the arena holds no storage.
+     */
+    std::span<std::byte> data() const;
+
+    /**
+     * @brief Carve out a sub-arena over a fixed region of this arena's storage.
+     *
+     * @details The returned arena is a @ref memory_source::external view of
+     * `[start, start + size)` within this arena; it does **not** own the memory, so
+     * destroying it leaves the parent untouched. This lets you hand an independent
+     * slice to a child function or a worker thread with no extra allocation. The
+     * caller is responsible for choosing non-overlapping regions.
+     * @param start Byte offset of the region within this arena.
+     * @param size  Size of the region in bytes.
+     * @param flags @ref flags controlling initialisation: the region is zeroed by
+     *              default (and with `commit`); pass `no_clear` to skip zeroing.
+     * @return A sub-arena bound to `[start, start + size)`.
+     */
+    [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0);
 };
 
 } // namespace engram

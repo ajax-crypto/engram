@@ -144,6 +144,14 @@ PYBIND11_MODULE(_engram, m)
         .def(
             "pop_bytes", [](arena& a, std::size_t nbytes) { a.pop_array<std::byte>(nbytes); },
             py::arg("nbytes"), "Release the last nbytes pushed (LIFO).")
+        .def(
+            "partition",
+            [](arena& a, std::size_t start, std::size_t size, int flags) {
+                return a.partition(start, size, flags);
+            },
+            py::arg("start"), py::arg("size"), py::arg("flags") = 0, py::keep_alive<0, 1>(),
+            "Create a non-owning sub-arena over [start, start+size) of this arena (zeroed by "
+            "default; pass flags.no_clear to skip). The parent is kept alive while the sub-arena lives.")
 
         // ---- prefetch / cache ---------------------------------------------
         .def(
@@ -174,6 +182,17 @@ PYBIND11_MODULE(_engram, m)
         .def_property_readonly("count", &arena::count)
         .def_property_readonly("total", &arena::total)
         .def_property_readonly("source", &arena::source)
+        .def(
+            "data",
+            [](arena& a) -> py::object {
+                auto span = a.data();
+                if (span.empty())
+                    return py::memoryview(py::bytes());
+                return py::memoryview::from_memory(span.data(), static_cast<py::ssize_t>(span.size()),
+                                                   /*readonly=*/false);
+            },
+            py::keep_alive<0, 1>(),
+            "Writable memoryview over the arena's whole underlying storage [base, capacity).")
         .def("__len__", [](arena& a) { return a.used(); })
         .def("__bool__", &arena::is_valid)
         .def("__repr__", [](arena& a) {
