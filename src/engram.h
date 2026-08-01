@@ -192,6 +192,11 @@ private:
     // Build an arena that adopts external storage (defined in engram.cpp).
     static arena make_external(std::byte* storage, std::size_t size, int32_t flags);
 
+    // Varargs backend dispatch (defined in engram.cpp). `provided` is the number of
+    // backend params that follow; any optional trailing param not provided is filled
+    // with the vendor default (see create_custom).
+    static arena create_custom_va(std::size_t size, custom type, int32_t flags, std::size_t provided, ...);
+
 public:
 
     /** @brief Opaque pointer to internal state (implementation detail). */
@@ -292,7 +297,11 @@ public:
      * @param type  Backend selector.
      * @param flags @ref flags value(s).
      */
-    [[nodiscard]] static arena create_custom(std::size_t size, custom type, int32_t flags, ...);
+    template <typename... Params>
+    [[nodiscard]] static arena create_custom(std::size_t size, custom type, int32_t flags, Params&&... params)
+    {
+        return create_custom_va(size, type, flags, sizeof...(params), std::forward<Params>(params)...);
+    }
 
 	arena(const arena&) = delete;            ///< Arenas are non-copyable.
 	arena& operator=(const arena&) = delete; ///< Arenas are non-copyable.

@@ -724,7 +724,7 @@ arena arena::heapfile(std::size_t size, std::string_view name, std::size_t align
 }
 #endif
 
-arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
+arena arena::create_custom_va(std::size_t size, custom type, int32_t flags, std::size_t provided, ...)
 {
     arena result;
     auto& d = *result.m_impl;
@@ -732,7 +732,7 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
     d.m_size = size;
 
     va_list args;
-    va_start(args, flags);
+    va_start(args, provided);
 
     switch (type)
     {
@@ -753,9 +753,9 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
         {
             auto device = va_arg(args, VkDevice);
             auto physicalDevice = va_arg(args, VkPhysicalDevice);
-            auto allocCbs = va_arg(args, const VkAllocationCallbacks*);
-            auto offset = va_arg(args, VkDeviceSize);
-            auto vkflags = va_arg(args, VkMemoryMapFlags);
+            auto allocCbs = provided > 2 ? va_arg(args, const VkAllocationCallbacks*) : nullptr;
+            auto offset = provided > 3 ? va_arg(args, VkDeviceSize) : VkDeviceSize{0};
+            auto vkflags = provided > 4 ? va_arg(args, VkMemoryMapFlags) : VkMemoryMapFlags{0};
             vendor::allocate_vulkan(d, device, physicalDevice, allocCbs, offset, vkflags, flags);
             break;
         }
@@ -764,8 +764,8 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
         case custom::DX12:
         {
             auto device = va_arg(args, ID3D12Device*);
-            auto descflags = (D3D12_RESOURCE_FLAGS)va_arg(args, int);
-            auto resflags = (D3D12_RESOURCE_STATES)va_arg(args, int);
+            auto descflags = provided > 1 ? (D3D12_RESOURCE_FLAGS)va_arg(args, int) : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            auto resflags = provided > 2 ? (D3D12_RESOURCE_STATES)va_arg(args, int) : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             vendor::allocate_dx12(d, device, descflags, resflags, flags);
             break;
         }
@@ -805,9 +805,9 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
         {
             auto name = va_arg(args, const char*);
             auto align = va_arg(args, int);
-            auto socketId = va_arg(args, int);
-            auto dpdkFlags = va_arg(args, unsigned int);
-            auto useVirtAddr = va_arg(args, int) != 0;
+            auto socketId = provided > 2 ? va_arg(args, int) : SOCKET_ID_ANY;
+            auto dpdkFlags = provided > 3 ? va_arg(args, unsigned int) : (unsigned int)RTE_MEMZONE_ZEROED;
+            auto useVirtAddr = provided > 4 ? (va_arg(args, int) != 0) : true;
             vendor::allocate_dpdk(name, align, socketId, dpdkFlags, useVirtAddr, d, flags);
             break;
         }
@@ -815,7 +815,7 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
 #ifdef ENGRAM_ENABLE_OP_TEE
         case custom::OpTee:
         {
-            auto hint = va_arg(args, uint32_t);
+            auto hint = provided > 0 ? va_arg(args, uint32_t) : (uint32_t)TEE_MALLOC_FILL_ZERO;
             vendor::allocate_op_tee(d, hint, flags);
             break;
         }
@@ -849,8 +849,8 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
         case custom::PMDK:
         {
             auto path = va_arg(args, const char*);
-            auto pmdk_flags = va_arg(args, int);
-            auto mode = va_arg(args, mode_t);
+            auto pmdk_flags = provided > 1 ? va_arg(args, int) : PMEM_FILE_CREATE;
+            auto mode = provided > 2 ? va_arg(args, mode_t) : (mode_t)0666;
             vendor::allocate_pmdk(d, path, pmdk_flags, mode, flags);
             break;
         }
@@ -860,7 +860,7 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
         {
             auto buffer = va_arg(args, void*);
             auto pd = va_arg(args, ibv_pd*);
-            auto access = va_arg(args, int);
+            auto access = provided > 2 ? va_arg(args, int) : IBV_ACCESS_LOCAL_WRITE;
             vendor::allocate_rdma(d, buffer, pd, access, flags);
             break;
         }
@@ -873,7 +873,7 @@ arena arena::create_custom(std::size_t size, custom type, int32_t flags, ...)
 #ifdef ENGRAM_ENABLE_DMABUF
         case custom::DmaBuf:
         {
-            auto deviceFd = va_arg(args, int);
+            auto deviceFd = provided > 0 ? va_arg(args, int) : -1;
             vendor::allocate_dmabuf(d, deviceFd, flags);
             break;
         }
