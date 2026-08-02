@@ -37,10 +37,14 @@ std::byte* reserve_bytes(arena& a, std::size_t nbytes)
 {
     if (nbytes == 0)
         throw py::value_error("allocation size must be greater than zero");
-    if (nbytes >= a.remaining())
+
+    // push_array returns an empty span when the (alignment-rounded) request does
+    // not fit, rather than overrunning the arena.
+    auto span = a.push_array<std::byte>(nbytes);
+    if (span.empty())
         throw py::value_error("allocation exceeds the arena's remaining capacity");
 
-    return a.push_array<std::byte>(nbytes).data();
+    return span.data();
 }
 
 } // namespace
@@ -171,6 +175,8 @@ PYBIND11_MODULE(_engram, m)
             "Issue CPU prefetch hints over a range of the arena.")
         .def("sync", [](arena& a) { return a.sync(); },
              "Synchronize a device-backed arena (no-op for host arenas).")
+        .def("reset", &arena::reset,
+             "Reclaim all storage in O(1), resetting the arena to empty (runs no destructors).")
         .def("unpin", &arena::unpin, "Release pages pinned via flags::pin_to_physical.")
 
         // ---- introspection -------------------------------------------------
@@ -179,8 +185,10 @@ PYBIND11_MODULE(_engram, m)
         .def_property_readonly("used", &arena::used)
         .def_property_readonly("capacity", &arena::capacity)
         .def_property_readonly("remaining", &arena::remaining)
-        .def_property_readonly("count", &arena::count)
-        .def_property_readonly("total", &arena::total)
+        .def_property_readonly("count", &arena::count,
+                               "Live array/string allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
+        .def_property_readonly("total", &arena::total,
+                               "Lifetime array/string allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
         .def_property_readonly("source", &arena::source)
         .def(
             "data",

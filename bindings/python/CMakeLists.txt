@@ -12,6 +12,13 @@ pybind11_add_module(_engram engram_ext.cpp)
 target_include_directories(_engram PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../single_header)
 target_compile_features(_engram PRIVATE cxx_std_20)
 
+# Optional: drop the per-allocation count/total counters (Arena.count / Arena.total
+# then always read 0).
+option(ENGRAM_DISABLE_TRACKING "Disable arena count/total allocation tracking." OFF)
+if(ENGRAM_DISABLE_TRACKING)
+    target_compile_definitions(_engram PRIVATE ENGRAM_DISABLE_TRACKING)
+endif()
+
 # The single header auto-enables the platform's default device backend
 # (DirectX 12 on Windows, Metal on Apple); link the corresponding system
 # libraries. No third-party SDK is required.

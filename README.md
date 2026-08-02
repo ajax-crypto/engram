@@ -236,6 +236,10 @@ a.data();       // std::span<std::byte> over the whole storage [base, capacity)
 a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 ```
 
+`count()` and `total()` are maintained by lightweight per-allocation counters.
+Define `ENGRAM_DISABLE_TRACKING` to drop those counters (and the two `std::size_t`
+fields backing them) entirely; both accessors then always return `0`.
+
 `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
 
@@ -370,6 +374,22 @@ to `engram::prefetch` (`madvise` / `PrefetchVirtualMemory`).
 
 Failures are reported through the `m_error` field using `arena_error`
 (`no_error`, `stack_overflow`, `alloc_failed`, `custom`) rather than exceptions.
+
+By default, exceptions thrown by the constructors of the objects you push are
+propagated: if an element's constructor throws, `push`/`push_array` roll back the
+reservation and rethrow, leaving the arena consistent (the basic exception guarantee).
+
+Define `ENGRAM_MASK_EXCEPTIONS` to make engram swallow those exceptions instead, so
+no arena operation ever throws:
+
+- `push<T>` never throws; a throwing constructor is caught and you receive a
+  reference to storage that may not hold a fully-constructed object.
+- `push_array` stops at the first element whose constructor throws, reclaims the
+  unused tail, and returns a truncated span.
+- Destructors invoked by `pop`/`pop_array`/`pop_string` that throw are ignored.
+
+The macro only takes effect when the compiler has exceptions enabled; with exceptions
+disabled it is a no-op (engram emits no `try`/`catch`).
 
 ## Optional Backends
 
@@ -657,8 +677,11 @@ What's exposed: the `Arena` factories (`create`, `stack`, `heap`, `adopt`),
 byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`, `partition`),
 introspection
 (`used`, `capacity`, `remaining`, `count`, `total`, `source`, `data`, `is_valid`,
-`empty`), `prefetch` / `warm_cache` / `sync` / `unpin`, the `MemorySource`,
+`empty`), `prefetch` / `warm_cache` / `sync` / `reset` / `unpin`, the `MemorySource`,
 `CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
+
+`count` / `total` reflect the per-allocation counters; build the extension with
+`-DENGRAM_DISABLE_TRACKING=ON` (CMake) to drop them, after which both always read `0`.
 
 Device/accelerator backends (CUDA, Vulkan, DirectX 12, …) are **not** exposed to
 Python — they need native device handles; use the C++ API for those. Returned

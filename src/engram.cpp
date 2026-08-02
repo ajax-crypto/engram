@@ -221,7 +221,9 @@ struct impl_data
     std::byte*  m_ptr = nullptr;
 	std::size_t m_offset = 0;
     std::size_t m_size = 0;
+#ifndef ENGRAM_DISABLE_TRACKING
     std::size_t m_count = 0, m_total = 0;
+#endif
 	memory_source m_type = memory_source::heap;
     arena_error m_error = arena_error::no_error;
     std::size_t m_alignment = alignof(std::max_align_t);
@@ -889,11 +891,28 @@ arena arena::make_external(std::byte* storage, std::size_t size, int32_t flags)
 {
     arena result;
     auto& d = *result.m_impl;
+
+    // Align the adopted base up to the max alignment so bump offsets (multiples
+    // of that quantum) yield correctly aligned addresses.
+    constexpr std::size_t A = alignof(std::max_align_t);
+    auto misalign = (std::size_t)(reinterpret_cast<std::uintptr_t>(storage) & (A - 1));
+    auto adjust = misalign ? (A - misalign) : 0;
+    if (adjust >= size)
+    {
+        storage = nullptr;
+        size = 0;
+    }
+    else
+    {
+        storage += adjust;
+        size -= adjust;
+    }
+
     d.m_ptr = storage;
     d.m_type = memory_source::external;
     d.m_size = size;
     d.m_clear_on_free = !(flags & engram::flags::no_clear);
-    if (flags & engram::flags::commit)
+    if (storage && (flags & engram::flags::commit))
         memset(storage, 0, size);
     return result;
 }
@@ -906,18 +925,38 @@ std::byte* arena::base_ptr() const
     return m_impl->m_ptr;
 }
 
+// Round a request up to the maximum fundamental alignment. Because the base is
+// always max-aligned and every reservation advances the offset by a multiple of
+// this quantum, each returned address is suitably aligned for any standard type
+// and pop remains exact without tracking per-allocation padding.
+static constexpr std::size_t align_up_max(std::size_t n)
+{
+    constexpr std::size_t A = alignof(std::max_align_t);
+    return (n + (A - 1)) & ~(A - 1);
+}
+
 std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
 {
+    assert(m_impl && "engram: cannot allocate from a moved-from arena");
     auto& d = *m_impl;
-    assert((d.m_offset + bytes) < d.m_size);
+    auto rounded = align_up_max(bytes);
+    if (!d.m_ptr || rounded > d.m_size - d.m_offset)
+    {
+        d.m_error = arena_error::alloc_failed;
+        return nullptr;
+    }
 
     auto slot = d.m_ptr + d.m_offset;
-    d.m_offset += bytes;
+    d.m_offset += rounded;
+#ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
     {
         d.m_count++;
         d.m_total++;
     }
+#else
+    (void)countable;
+#endif
 #ifdef ENGRAM_EASY_POP
     if (track)
         d.m_array_sizes[d.m_array_stacksz++] = { slot, bytes };
@@ -930,11 +969,16 @@ std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
 std::byte* arena::unreserve(std::size_t bytes, bool countable)
 {
     auto& d = *m_impl;
-    assert(bytes < d.m_offset);
+    auto rounded = align_up_max(bytes);
+    assert(rounded <= d.m_offset);
 
-    d.m_offset -= bytes;
+    d.m_offset -= rounded;
+#ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
         --d.m_count;
+#else
+    (void)countable;
+#endif
     return d.m_ptr + d.m_offset;
 }
 
@@ -943,11 +987,15 @@ std::pair<std::byte*, std::size_t> arena::unreserve_tracked(bool countable)
 {
     auto& d = *m_impl;
     auto bytes = d.m_array_sizes[d.m_array_stacksz - 1].second;
-    assert(bytes < d.m_offset);
+    assert(align_up_max(bytes) <= d.m_offset);
 
-    d.m_offset -= bytes;
+    d.m_offset -= align_up_max(bytes);
+#ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
         --d.m_count;
+#else
+    (void)countable;
+#endif
     --d.m_array_stacksz;
     return { d.m_ptr + d.m_offset, bytes };
 }
@@ -956,16 +1004,21 @@ std::pair<std::byte*, std::size_t> arena::unreserve_tracked(bool countable)
 // ---------------------------------------------------------------------------
 // Introspection accessors.
 // ---------------------------------------------------------------------------
-bool arena::is_valid() const { return m_impl->m_ptr != nullptr; }
-bool arena::empty() const { return m_impl->m_offset == 0; }
-std::size_t arena::used() const { return m_impl->m_offset; }
-std::size_t arena::capacity() const { return m_impl->m_size; }
-std::size_t arena::remaining() const { return m_impl->m_size - m_impl->m_offset; }
-std::size_t arena::count() const { return m_impl->m_count; }
-std::size_t arena::total() const { return m_impl->m_total; }
-memory_source arena::source() const { return m_impl->m_type; }
+bool arena::is_valid() const noexcept { return m_impl->m_ptr != nullptr; }
+bool arena::empty() const noexcept { return m_impl->m_offset == 0; }
+std::size_t arena::used() const noexcept { return m_impl->m_offset; }
+std::size_t arena::capacity() const noexcept { return m_impl->m_size; }
+std::size_t arena::remaining() const noexcept { return m_impl->m_size - m_impl->m_offset; }
+#ifndef ENGRAM_DISABLE_TRACKING
+std::size_t arena::count() const noexcept { return m_impl->m_count; }
+std::size_t arena::total() const noexcept { return m_impl->m_total; }
+#else
+std::size_t arena::count() const noexcept { return 0; }
+std::size_t arena::total() const noexcept { return 0; }
+#endif
+memory_source arena::source() const noexcept { return m_impl->m_type; }
 
-std::span<std::byte> arena::data() const
+std::span<std::byte> arena::data() const noexcept
 {
     auto& d = *m_impl;
     return d.m_ptr ? std::span<std::byte>{ d.m_ptr, d.m_size } : std::span<std::byte>{};
@@ -1001,7 +1054,7 @@ std::pmr::monotonic_buffer_resource& arena::get_pmr_resource(std::pmr::memory_re
 {
     auto& d = *m_impl;
     if (!d.m_pmr.has_value())
-        d.m_pmr.emplace(d.m_ptr, d.m_size, upstream);
+        d.m_pmr.emplace(d.m_ptr + d.m_offset, d.m_size - d.m_offset, upstream);
     return d.m_pmr.value();
 }
 
@@ -1016,6 +1069,21 @@ std::pmr::monotonic_buffer_resource& arena::get_pmr_resource(std::size_t start, 
 }
 #endif
 
+void arena::reset() noexcept
+{
+    auto& d = *m_impl;
+    d.m_offset = 0;
+#ifndef ENGRAM_DISABLE_TRACKING
+    d.m_count = 0;
+#endif
+#ifdef ENGRAM_EASY_POP
+    d.m_array_stacksz = 0;
+#endif
+#ifndef ENGRAM_DISABLE_PMR
+    d.m_pmr.reset();
+#endif
+}
+
 void arena::unpin()
 {
     auto& d = *m_impl;
@@ -1029,16 +1097,17 @@ void arena::unpin()
     }
 }
 
-bool arena::sync(...)
+bool arena::sync_va(std::size_t provided, ...)
 {
     auto& d = *m_impl;
     va_list args;
     bool ok = false;
     (void)d;
+    (void)provided;
 #ifdef ENGRAM_ENABLE_XDNA
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_xdna))
     {
-        va_start(args, this);
+        va_start(args, provided);
         bool host_to_device = va_arg(args, int) != 0;
         va_end(args);
 
@@ -1075,7 +1144,7 @@ bool arena::sync(...)
 #ifdef ENGRAM_ENABLE_OPENCL
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_opencl))
     {
-        va_start(args, this);
+        va_start(args, provided);
         cl_command_queue queue = va_arg(args, cl_command_queue);
         va_end(args);
 
@@ -1086,7 +1155,7 @@ bool arena::sync(...)
 #ifdef ENGRAM_ENABLE_PMDK
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_pmdk))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         va_end(args);
@@ -1113,15 +1182,16 @@ bool arena::sync(...)
     return ok;
 }
 
-bool arena::prefetch(...)
+bool arena::prefetch_va(std::size_t provided, ...)
 {
     auto& d = *m_impl;
     va_list args;
     bool ok = false;
+    (void)provided;
 
     if (d.m_ptr && d.m_type == memory_source::heap)
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t size = va_arg(args, std::size_t);
         va_end(args);
@@ -1132,7 +1202,7 @@ bool arena::prefetch(...)
 #ifdef ENGRAM_ENABLE_CUDA
     if (d.m_ptr && d.m_is_managed && (d.m_extra == (void*)&vendor::free_cuda))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         int device = va_arg(args, int);
@@ -1145,7 +1215,7 @@ bool arena::prefetch(...)
 #ifdef ENGRAM_ENABLE_ROCM
     if (d.m_ptr && d.m_is_managed && (d.m_extra == (void*)&vendor::free_rocm))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         int device = va_arg(args, int);
@@ -1158,7 +1228,7 @@ bool arena::prefetch(...)
 #ifdef ENGRAM_ENABLE_SYCL
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_sycl))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         va_end(args);
@@ -1180,7 +1250,7 @@ bool arena::prefetch(...)
 #ifdef ENGRAM_ENABLE_OPENCL
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_opencl))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         cl_command_queue queue = va_arg(args, cl_command_queue);
@@ -1198,7 +1268,7 @@ bool arena::prefetch(...)
 #ifdef ENGRAM_ENABLE_RDMA
     if (d.m_ptr && (d.m_type == memory_source::custom) && (d.m_extra == (void*)&vendor::free_rdma))
     {
-        va_start(args, this);
+        va_start(args, provided);
         std::size_t start = va_arg(args, std::size_t);
         std::size_t end = va_arg(args, std::size_t);
         va_end(args);

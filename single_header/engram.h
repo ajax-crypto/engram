@@ -11,6 +11,7 @@
 #endif
 
 #include <cstddef>
+#include <cstdint>
 #include <tuple>
 #include <type_traits>
 #include <span>
@@ -720,12 +721,23 @@ private:
     arena() {}
 
     template <typename T, typename... ArgsT>
-	static void initialize(std::byte* ptr, ArgsT&&... args)
+	static bool initialize(std::byte* ptr, ArgsT&&... args)
 	{
-		if constexpr (std::is_constructible_v<T>)
-			new ((void*)ptr) T{ std::forward<ArgsT>(args)... };
-		else if constexpr (sizeof...(args) == 0 && !std::is_scalar_v<T> && std::is_default_constructible_v<T>)
-			new ((void*)ptr) T{};
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        try {
+#endif
+            if constexpr (std::is_constructible_v<T>)
+                new ((void*)ptr) T{ std::forward<ArgsT>(args)... };
+            else if constexpr (sizeof...(args) == 0 && !std::is_scalar_v<T> && std::is_default_constructible_v<T>)
+                new ((void*)ptr) T{};
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        }
+        catch (...) {
+            return false;
+        }
+#endif
+
+        return true;
 	}
 
     template <typename T>
@@ -735,6 +747,77 @@ private:
 			((T*)(ptr))->~T();
     }
 
+    // Round a request up to the maximum fundamental alignment; keeps every bump
+    // offset a multiple of that quantum so each returned address is aligned for
+    // any standard type and pop stays exact without tracking padding.
+    static constexpr std::size_t align_up_max(std::size_t n)
+    {
+        constexpr std::size_t A = alignof(std::max_align_t);
+        return (n + (A - 1)) & ~(A - 1);
+    }
+
+    std::byte* reserve(std::size_t bytes, bool countable, bool track)
+    {
+        auto rounded = align_up_max(bytes);
+        if (!m_ptr || rounded > m_size - m_offset)
+        {
+            m_error = arena_error::alloc_failed;
+            return nullptr;
+        }
+
+        auto slot = m_ptr + m_offset;
+        m_offset += rounded;
+#ifndef ENGRAM_DISABLE_TRACKING
+        if (countable)
+        {
+            m_count++;
+            m_total++;
+        }
+#else
+        (void)countable;
+#endif
+#ifdef ENGRAM_EASY_POP
+        if (track)
+            m_array_sizes[m_array_stacksz++] = { slot, bytes };
+#else
+        (void)track;
+#endif
+        return slot;
+    }
+
+    std::byte* unreserve(std::size_t bytes, bool countable)
+    {
+        auto rounded = align_up_max(bytes);
+        assert(rounded <= m_offset);
+
+        m_offset -= rounded;
+#ifndef ENGRAM_DISABLE_TRACKING
+        if (countable)
+            --m_count;
+#else
+        (void)countable;
+#endif
+        return m_ptr + m_offset;
+    }
+
+#ifdef ENGRAM_EASY_POP
+    std::pair<std::byte*, std::size_t> unreserve_tracked(bool countable)
+    {
+        auto bytes = m_array_sizes[m_array_stacksz - 1].second;
+        assert(align_up_max(bytes) <= m_offset);
+
+        m_offset -= align_up_max(bytes);
+#ifndef ENGRAM_DISABLE_TRACKING
+        if (countable)
+            --m_count;
+#else
+        (void)countable;
+#endif
+        --m_array_stacksz;
+        return { m_ptr + m_offset, bytes };
+    }
+#endif
+
 public:
 
 	// The following data members hold the arena's internal state. They are public
@@ -742,7 +825,9 @@ public:
 	std::byte*  m_ptr = nullptr;
 	std::size_t m_offset = 0;
     std::size_t m_size = 0;
+#ifndef ENGRAM_DISABLE_TRACKING
     std::size_t m_count = 0, m_total = 0;
+#endif
 	memory_source m_type;
     arena_error m_error = arena_error::no_error;
     std::size_t m_alignment = alignof(std::max_align_t);
@@ -893,12 +978,30 @@ public:
         assert(storage != nullptr);
 
         arena result;
-        result.m_ptr = (std::byte*)storage;
+
+        // Align the adopted base up to the max alignment so bump offsets yield
+        // correctly aligned addresses.
+        constexpr std::size_t A = alignof(std::max_align_t);
+        auto raw = (std::byte*)storage;
+        auto misalign = (std::size_t)(reinterpret_cast<std::uintptr_t>(raw) & (A - 1));
+        auto adjust = misalign ? (A - misalign) : 0;
+        if (adjust >= size)
+        {
+            raw = nullptr;
+            size = 0;
+        }
+        else
+        {
+            raw += adjust;
+            size -= adjust;
+        }
+
+        result.m_ptr = raw;
         result.m_type = memory_source::external;
         result.m_size = size;
         result.m_clear_on_free = !(flags & engram::flags::no_clear);
-        if (flags & engram::flags::commit)
-            memset(storage, 0, size);
+        if (raw && (flags & engram::flags::commit))
+            memset(raw, 0, size);
         return result;
     }
 
@@ -1264,8 +1367,10 @@ public:
         std::swap(m_offset, other.m_offset);
         m_type = other.m_type;
         m_extra = other.m_extra;
+#ifndef ENGRAM_DISABLE_TRACKING
         m_total = other.m_total;
         m_count = other.m_count;
+#endif
         m_use_sys_free = other.m_use_sys_free;
         m_clear_on_free = other.m_clear_on_free;
         m_is_managed = other.m_is_managed;
@@ -1288,8 +1393,10 @@ public:
         std::swap(m_offset, other.m_offset);
         m_type = other.m_type;
         m_extra = other.m_extra;
+#ifndef ENGRAM_DISABLE_TRACKING
         m_total = other.m_total;
         m_count = other.m_count;
+#endif
         m_use_sys_free = other.m_use_sys_free;
         m_clear_on_free = other.m_clear_on_free;
         m_is_managed = other.m_is_managed;
@@ -1317,7 +1424,10 @@ public:
 		}
 		
 		m_ptr = nullptr;
-		m_offset = m_count = m_total = 0;
+		m_offset = 0;
+#ifndef ENGRAM_DISABLE_TRACKING
+		m_count = m_total = 0;
+#endif
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr = std::nullopt;
 #endif
@@ -1332,7 +1442,7 @@ public:
         std::pmr::null_memory_resource())
     {
         if (!m_pmr.has_value())
-            m_pmr.emplace(m_ptr, m_size, upstream);
+            m_pmr.emplace(m_ptr + m_offset, m_size - m_offset, upstream);
         return m_pmr.value();
     }
 
@@ -1360,15 +1470,23 @@ public:
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
-		assert((m_offset + sizeof(T)) < m_size);
-		
-		auto valptr = (T*)(m_ptr + m_offset);
+		auto slot = reserve(sizeof(T), true, false);
         if constexpr (!std::is_same_v<T, arena>)
-		    initialize<T, ArgsT...>(m_ptr + m_offset, std::forward<ArgsT>(args)...);
+        {
+#if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+            try {
+#endif
+		        initialize<T, ArgsT...>(slot, std::forward<ArgsT>(args)...);
+                return *reinterpret_cast<T*>(slot);
+#if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+            } catch (...) {
+                unreserve(sizeof(T), true);
+                throw;
+            }
+#endif
+        }
         else
-            valptr = new (m_ptr + m_offset) arena{ create(std::forward<ArgsT>(args)...) };
-		m_offset += sizeof(T);
-		return *valptr;
+            return *new (slot) arena{ create(std::forward<ArgsT>(args)...) };
 	}
 	
 	/**
@@ -1379,21 +1497,34 @@ public:
 	template <std::size_t size, typename T, typename... ArgsT>
 	[[nodiscard]] std::span<T> push_array(ArgsT&&... args)
 	{
-		assert(size > 0);
-	
-		auto totalsz = sizeof(T) * size;
-		assert((m_offset + totalsz) < m_size);
-		
-		auto valptr = (T*)(m_ptr + m_offset);
+		static_assert(size > 0);
+
+		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, false));
+		if (!valptr)
+			return {};
 		if constexpr (sizeof...(args) > 0)
 		{
 			auto ptr = valptr;
-			for (auto idx = 0; idx < size; ++idx, ++ptr)
-				initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#if defined(ENGRAM_MASK_EXCEPTIONS)
+				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
+                {
+                    unreserve(sizeof(T) * (size - idx), true);
+                    return { valptr, idx + 1u };
+                }
+#else
+                try {
+                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+                } catch (...) {
+                    unreserve(sizeof(T) * size, true);
+                    throw;
+                }
+#endif
+#else
+                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+#endif
 		}
-		
-		m_offset += totalsz;
-        m_count++; m_total++;
 		return { valptr, (std::size_t)size };
 	}
 
@@ -1401,15 +1532,11 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT (&str)[size])
     {
-        auto totalsz = (size + 1) * sizeof(CharT);
-        assert((m_offset + totalsz) < m_size);
-
-        auto valptr = (CharT*)(m_ptr + m_offset);
-        std::memcpy(valptr, str, size * sizeof(CharT));
-        valptr[size] = CharT{};
-
-        m_offset += totalsz;
-        m_count++; m_total++;
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        if (!valptr)
+            return {};
+        Traits::copy(valptr, str, size);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 
@@ -1417,15 +1544,11 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT fillchar = CharT{})
     {
-        auto totalsz = (size + 1) * sizeof(CharT);
-        assert((m_offset + totalsz) < m_size);
-
-        auto valptr = (CharT*)(m_ptr + m_offset);
-        std::memset(valptr, fillchar, size * sizeof(CharT));
-        valptr[size] = CharT{};
-
-        m_offset += totalsz;
-        m_count++; m_total++;
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        if (!valptr)
+            return {};
+        Traits::assign(valptr, size, fillchar);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 
@@ -1437,23 +1560,33 @@ public:
 	[[nodiscard]] std::span<T> push_array(std::size_t size, ArgsT&&... args)
 	{
 		assert(size > 0);
-	
-		auto totalsz = sizeof(T) * size;
-		assert((m_offset + totalsz) < m_size);
-		
-		auto valptr = (T*)(m_ptr + m_offset);
+
+		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, true));
+		if (!valptr)
+			return {};
 		if constexpr (sizeof...(args) > 0)
 		{
 			auto ptr = valptr;
-			for (auto idx = 0; idx < size; ++idx, ++ptr)
-				initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
-		}
-		
-		m_offset += totalsz;
-        m_count++; m_total++;
-#ifdef ENGRAM_EASY_POP
-        m_array_sizes[m_array_stacksz++] = { (std::byte*)valptr, totalsz };
+			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#if defined(ENGRAM_MASK_EXCEPTIONS)
+				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
+                {
+                    unreserve(sizeof(T) * (size - idx), true);
+                    return { valptr, idx + 1u };
+                }
+#else
+                try {
+                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+                } catch (...) {
+                    unreserve(sizeof(T) * size, true);
+                    throw;
+                }
 #endif
+#else
+                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+#endif
+		}
 		return { valptr, (std::size_t)size };
 	}
 
@@ -1461,18 +1594,11 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::basic_string_view<CharT, Traits> str)
     {
-        auto totalsz = (str.size() + 1) * sizeof(CharT);
-        assert((m_offset + totalsz) < m_size);
-
-        auto valptr = (CharT*)(m_ptr + m_offset);
-        std::memcpy(valptr, str.data(), str.size() * sizeof(CharT));
-        valptr[str.size()] = CharT{};
-
-        m_offset += totalsz;
-        m_count++; m_total++;
-#ifdef ENGRAM_EASY_POP
-        m_array_sizes[m_array_stacksz++] = { (std::byte*)valptr, str.size() };
-#endif
+        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true, true));
+        if (!valptr)
+            return {};
+        Traits::copy(valptr, str.data(), str.size());
+        Traits::assign(valptr[str.size()], CharT{});
         return { valptr, str.size() };
     }
 
@@ -1480,18 +1606,11 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::size_t size, CharT fillchar = CharT{})
     {
-        auto totalsz = (size + 1) * sizeof(CharT);
-        assert((m_offset + totalsz) < m_size);
-
-        auto valptr = (CharT*)(m_ptr + m_offset);
-        std::memset(valptr, fillchar, size * sizeof(CharT));
-        valptr[size] = CharT{};
-
-        m_offset += totalsz;
-        m_count++; m_total++;
-#ifdef ENGRAM_EASY_POP
-        m_array_sizes[m_array_stacksz++] = { (std::byte*)valptr, size };
-#endif
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, true));
+        if (!valptr)
+            return {};
+        Traits::assign(valptr, size, fillchar);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 	
@@ -1499,27 +1618,21 @@ public:
 	template <typename T>
 	void pop() 
 	{ 
-		assert(sizeof(T) < m_offset);
-		m_offset -= sizeof(T); 
-		release<T>(m_ptr + m_offset);
-        --m_count;
+		release<T>(unreserve(sizeof(T), false));
 	}
 
     /** @brief Destroy and pop a runtime-sized `T` array (@p size elements). */
     template <typename T>
 	void pop_array(std::size_t size) 
     {
-        auto totalsz = sizeof(T) * size;
-		assert(totalsz < m_offset);
-		m_offset -= totalsz; 
+		auto valptr = unreserve(sizeof(T) * size, true);
 		if constexpr (!std::is_scalar_v<T> && std::is_destructible_v<T>)
-			for (auto idx = 0; idx < size; ++idx)
-				release<T>(m_ptr + m_offset + (idx * sizeof(T)));
-        --m_count;
+			for (std::size_t idx = 0; idx < size; ++idx)
+				release<T>(valptr + (idx * sizeof(T)));
     }
 	
 	/** @brief Destroy and pop a compile-time-sized `T` array. */
-	template <int size, typename T>
+	template <std::size_t size, typename T>
 	void pop_array() 
 	{ 
 		pop_array<T>(size);
@@ -1536,10 +1649,7 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     void pop_string(std::basic_string_view<CharT, Traits> str)
     {
-        auto totalsz = (str.size() + 1) * sizeof(CharT);
-        assert(totalsz < m_offset);
-        m_offset -= totalsz;
-        --m_count;
+        unreserve((str.size() + 1) * sizeof(CharT), true);
     }
 
 #ifdef ENGRAM_EASY_POP
@@ -1548,28 +1658,40 @@ public:
     template <typename T>
 	void pop_array() 
 	{ 
-		auto totalsz = m_array_sizes[m_array_stacksz - 1].second;
-		assert(totalsz < m_offset);
-		m_offset -= totalsz; 
+		auto [valptr, bytes] = unreserve_tracked(true);
 		if constexpr (!std::is_scalar_v<T> && std::is_destructible_v<T>)
-			for (auto idx = 0; idx < totalsz / sizeof(T); ++idx)
-				release<T>(m_ptr + m_offset + (idx * sizeof(T)));
-        --m_count;
-        --m_array_stacksz;
+			for (std::size_t idx = 0; idx < bytes / sizeof(T); ++idx)
+				release<T>(valptr + (idx * sizeof(T)));
 	}
 
     /** @brief Pop the most recently pushed string without re-specifying its size (requires `ENGRAM_EASY_POP`). */
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     void pop_string()
     {
-        auto totalsz = m_array_sizes[m_array_stacksz - 1].second;
-        assert(totalsz < m_offset);
-        m_offset -= totalsz;
-        --m_array_stacksz;
-        --m_count;
+        unreserve_tracked(true);
     }
 
 #endif
+
+    /**
+     * @brief Reclaim all storage in O(1), resetting the arena to empty.
+     * @details Rewinds the arena and clears the live allocation count without
+     * running any destructors, so use it for trivially-destructible data or
+     * after you have already popped whatever needs cleanup.
+     */
+    void reset() noexcept
+    {
+        m_offset = 0;
+#ifndef ENGRAM_DISABLE_TRACKING
+        m_count = 0;
+#endif
+#ifdef ENGRAM_EASY_POP
+        m_array_stacksz = 0;
+#endif
+#ifndef ENGRAM_DISABLE_PMR
+        m_pmr.reset();
+#endif
+    }
 
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin()
@@ -1594,14 +1716,21 @@ public:
      *   - GPUDirect : `sync()` (device synchronize)
      * @return `true` on success; host arenas return `false`.
      */
-    bool sync(...)
+    template <typename... Params>
+    bool sync(Params&&... params)
+    {
+        return sync_va(sizeof...(params), std::forward<Params>(params)...);
+    }
+
+    bool sync_va(std::size_t provided, ...)
     {
         va_list args;
         bool ok = false;
+        (void)provided;
 #ifdef ENGRAM_ENABLE_XDNA
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_xdna))
         {
-            va_start(args, this);
+            va_start(args, provided);
             bool host_to_device = va_arg(args, int) != 0;
             va_end(args);
 
@@ -1638,7 +1767,7 @@ public:
 #ifdef ENGRAM_ENABLE_OPENCL
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_opencl))
         {
-            va_start(args, this);
+            va_start(args, provided);
             cl_command_queue queue = va_arg(args, cl_command_queue);
             va_end(args);
 
@@ -1649,7 +1778,7 @@ public:
 #ifdef ENGRAM_ENABLE_PMDK
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_pmdk))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             va_end(args);
@@ -1685,14 +1814,21 @@ public:
      *   - RDMA        : `prefetch(size_t start, size_t end)` (ibv_advise_mr)
      * @return `true` if the prefetch was issued.
      */
-    bool prefetch(...)
+    template <typename... Params>
+    bool prefetch(Params&&... params)
+    {
+        return prefetch_va(sizeof...(params), std::forward<Params>(params)...);
+    }
+
+    bool prefetch_va(std::size_t provided, ...)
     {
         va_list args;
         bool ok = false;
+        (void)provided;
 
         if (m_ptr && m_type == memory_source::heap)
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t size = va_arg(args, std::size_t);
             va_end(args);
@@ -1703,7 +1839,7 @@ public:
 #ifdef ENGRAM_ENABLE_CUDA
         if (m_ptr && m_is_managed && (m_extra == (void*)&vendor::free_cuda))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             int device = va_arg(args, int);
@@ -1716,7 +1852,7 @@ public:
 #ifdef ENGRAM_ENABLE_ROCM
         if (m_ptr && m_is_managed && (m_extra == (void*)&vendor::free_rocm))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             int device = va_arg(args, int);
@@ -1729,7 +1865,7 @@ public:
 #ifdef ENGRAM_ENABLE_SYCL
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_sycl))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             va_end(args);
@@ -1751,7 +1887,7 @@ public:
 #ifdef ENGRAM_ENABLE_OPENCL
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_opencl))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             cl_command_queue queue = va_arg(args, cl_command_queue);
@@ -1769,7 +1905,7 @@ public:
 #ifdef ENGRAM_ENABLE_RDMA
         if (m_ptr && (m_type == memory_source::custom) && (m_extra == (void*)&vendor::free_rdma))
         {
-            va_start(args, this);
+            va_start(args, provided);
             std::size_t start = va_arg(args, std::size_t);
             std::size_t end = va_arg(args, std::size_t);
             va_end(args);
@@ -1822,22 +1958,27 @@ public:
         }
     }
 
-    bool is_valid() const { return m_ptr != nullptr; }   ///< @return `true` if the arena holds valid storage.
-    bool empty() const { return m_offset == 0; }         ///< @return `true` if nothing has been pushed yet.
+    bool is_valid() const noexcept { return m_ptr != nullptr; }   ///< @return `true` if the arena holds valid storage.
+    bool empty() const noexcept { return m_offset == 0; }         ///< @return `true` if nothing has been pushed yet.
 
-    std::size_t used() const { return m_offset; }        ///< @return Bytes currently in use.
-    std::size_t capacity() const { return m_size; }      ///< @return Total capacity in bytes.
-    std::size_t remaining() const { return m_size - m_offset; } ///< @return Bytes still available.
-    std::size_t count() const { return m_count; }        ///< @return Live array/string allocation count.
-    std::size_t total() const { return m_total; }        ///< @return Lifetime array/string allocation count.
-    memory_source source() const { return m_type; }      ///< @return The arena's @ref memory_source.
+    std::size_t used() const noexcept { return m_offset; }        ///< @return Bytes currently in use.
+    std::size_t capacity() const noexcept { return m_size; }      ///< @return Total capacity in bytes.
+    std::size_t remaining() const noexcept { return m_size - m_offset; } ///< @return Bytes still available.
+#ifndef ENGRAM_DISABLE_TRACKING
+    std::size_t count() const noexcept { return m_count; }        ///< @return Live array/string allocation count.
+    std::size_t total() const noexcept { return m_total; }        ///< @return Lifetime array/string allocation count.
+#else
+    std::size_t count() const noexcept { return 0; }              ///< @return 0 (tracking disabled).
+    std::size_t total() const noexcept { return 0; }              ///< @return 0 (tracking disabled).
+#endif
+    memory_source source() const noexcept { return m_type; }      ///< @return The arena's @ref memory_source.
 
     /**
      * @brief Access the arena's underlying storage as a contiguous byte range.
      * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
      *         or an empty span if the arena holds no storage.
      */
-    std::span<std::byte> data() const
+    std::span<std::byte> data() const noexcept
     {
         return m_ptr ? std::span<std::byte>{ m_ptr, m_size } : std::span<std::byte>{};
     }

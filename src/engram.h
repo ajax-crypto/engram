@@ -150,22 +150,44 @@ struct impl_data;
 class arena
 {
 private:
+    /** @brief Opaque pointer to internal state (implementation detail). */
+    impl_data* m_impl = nullptr;
+
     arena();
 
     template <typename T, typename... ArgsT>
-	static void initialize(std::byte* ptr, ArgsT&&... args)
+	static bool initialize(std::byte* ptr, ArgsT&&... args)
 	{
-		if constexpr (std::is_constructible_v<T>)
-			new ((void*)ptr) T{ std::forward<ArgsT>(args)... };
-		else if constexpr (sizeof...(args) == 0 && !std::is_scalar_v<T> && std::is_default_constructible_v<T>)
-			new ((void*)ptr) T{};
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        try {
+#endif
+            if constexpr (std::is_constructible_v<T>)
+                new ((void*)ptr) T{ std::forward<ArgsT>(args)... };
+            else if constexpr (sizeof...(args) == 0 && !std::is_scalar_v<T> && std::is_default_constructible_v<T>)
+                new ((void*)ptr) T{};
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        }
+        catch (...) {
+            return false;
+        }
+#endif
+
+        return true;
 	}
 
     template <typename T>
     static void release(std::byte* ptr)
     {
         if constexpr (!std::is_scalar_v<T> && !std::is_reference_v<T> && std::is_destructible_v<T>)
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        try {
+#endif
 			((T*)(ptr))->~T();
+#if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+        }
+        catch (...) {
+        }
+#endif
     }
 
     // ---- PIMPL bookkeeping helpers (defined in engram.cpp) ------------------
@@ -197,10 +219,12 @@ private:
     // with the vendor default (see create_custom).
     static arena create_custom_va(std::size_t size, custom type, int32_t flags, std::size_t provided, ...);
 
-public:
+    // Varargs backends for sync/prefetch (defined in engram.cpp). `provided` is the
+    // number of backend params that follow; see the sync/prefetch templates.
+    bool sync_va(std::size_t provided, ...);
+    bool prefetch_va(std::size_t provided, ...);
 
-    /** @brief Opaque pointer to internal state (implementation detail). */
-    impl_data* m_impl = nullptr;
+public:
 	
 	/**
 	 * @brief Create an arena backed by @p type.
@@ -348,11 +372,20 @@ public:
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
-		auto slot = reserve(sizeof(T), false, false);
+		auto slot = reserve(sizeof(T), true, false);
         if constexpr (!std::is_same_v<T, arena>)
         {
-		    initialize<T, ArgsT...>(slot, std::forward<ArgsT>(args)...);
-            return *reinterpret_cast<T*>(slot);
+#if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+            try {
+#endif
+		        initialize<T, ArgsT...>(slot, std::forward<ArgsT>(args)...);
+                return *reinterpret_cast<T*>(slot);
+#if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
+            } catch (...) {
+                unreserve(sizeof(T), true);
+                throw;
+            }
+#endif
         }
         else
             return *new (slot) arena{ create(std::forward<ArgsT>(args)...) };
@@ -369,13 +402,32 @@ public:
 		static_assert(size > 0);
 
 		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, false));
+		if (!valptr)
+			return {};
 		if constexpr (sizeof...(args) > 0)
 		{
 			auto ptr = valptr;
 			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
-				initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#if defined(ENGRAM_MASK_EXCEPTIONS)
+				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
+                {
+                    unreserve(sizeof(T) * (size - idx), true);
+                    return { valptr, idx + 1u };
+                }
+#else
+                try {
+                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+                } catch (...) {
+                    unreserve(sizeof(T) * size, true);
+                    throw;
+                }
+#endif
+#else
+                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+#endif
 		}
-		return { valptr, (std::size_t)size };
+		return { valptr, size };
 	}
 
     /** @brief Copy a compile-time-sized character array into the arena (NUL-terminated). */
@@ -383,8 +435,10 @@ public:
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT (&str)[size])
     {
         auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
-        std::memcpy(valptr, str, size * sizeof(CharT));
-        valptr[size] = CharT{};
+        if (!valptr)
+            return {};
+        Traits::copy(valptr, str, size);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 
@@ -393,8 +447,10 @@ public:
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT fillchar = CharT{})
     {
         auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
-        std::memset(valptr, fillchar, size * sizeof(CharT));
-        valptr[size] = CharT{};
+        if (!valptr)
+            return {};
+        Traits::assign(valptr, size, fillchar);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 
@@ -408,11 +464,30 @@ public:
 		assert(size > 0);
 
 		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, true));
+		if (!valptr)
+			return {};
 		if constexpr (sizeof...(args) > 0)
 		{
 			auto ptr = valptr;
 			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
-				initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+				#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#if defined(ENGRAM_MASK_EXCEPTIONS)
+				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
+                {
+                    unreserve(sizeof(T) * (size - idx), true);
+                    return { valptr, idx + 1u };
+                }
+#else
+                try {
+                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+                } catch (...) {
+                    unreserve(sizeof(T) * size, true);
+                    throw;
+                }
+#endif
+#else
+                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+#endif
 		}
 		return { valptr, (std::size_t)size };
 	}
@@ -422,8 +497,10 @@ public:
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::basic_string_view<CharT, Traits> str)
     {
         auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true, true));
-        std::memcpy(valptr, str.data(), str.size() * sizeof(CharT));
-        valptr[str.size()] = CharT{};
+        if (!valptr)
+            return {};
+        Traits::copy(valptr, str.data(), str.size());
+        Traits::assign(valptr[str.size()], CharT{});
         return { valptr, str.size() };
     }
 
@@ -432,8 +509,10 @@ public:
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::size_t size, CharT fillchar = CharT{})
     {
         auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, true));
-        std::memset(valptr, fillchar, size * sizeof(CharT));
-        valptr[size] = CharT{};
+        if (!valptr)
+            return {};
+        Traits::assign(valptr, size, fillchar);
+        Traits::assign(valptr[size], CharT{});
         return { valptr, size };
     }
 	
@@ -441,7 +520,7 @@ public:
 	template <typename T>
 	void pop() 
 	{ 
-		release<T>(unreserve(sizeof(T), true));
+		release<T>(unreserve(sizeof(T), false));
 	}
 
     /** @brief Destroy and pop a runtime-sized `T` array (@p size elements). */
@@ -455,7 +534,7 @@ public:
     }
 	
 	/** @brief Destroy and pop a compile-time-sized `T` array. */
-	template <int size, typename T>
+	template <std::size_t size, typename T>
 	void pop_array() 
 	{ 
 		pop_array<T>(size);
@@ -496,6 +575,14 @@ public:
 
 #endif
 
+    /**
+     * @brief Reclaim all storage in O(1), resetting the arena to empty.
+     * @details Rewinds the arena and clears the live allocation count without
+     * running any destructors, so use it for trivially-destructible data or
+     * after you have already popped whatever needs cleanup.
+     */
+    void reset() noexcept;
+
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin();
 
@@ -509,7 +596,11 @@ public:
      *   - GPUDirect : `sync()` (device synchronize)
      * @return `true` on success; host arenas return `false`.
      */
-    bool sync(...);
+    template <typename... Params>
+    bool sync(Params&&... params)
+    {
+        return sync_va(sizeof...(params), std::forward<Params>(params)...);
+    }
 
     /**
      * @brief Prefetch a range of the arena. Extra arguments are backend-specific:
@@ -520,7 +611,11 @@ public:
      *   - RDMA        : `prefetch(size_t start, size_t end)` (ibv_advise_mr)
      * @return `true` if the prefetch was issued.
      */
-    bool prefetch(...);
+    template <typename... Params>
+    bool prefetch(Params&&... params)
+    {
+        return prefetch_va(sizeof...(params), std::forward<Params>(params)...);
+    }
 
     /**
      * @brief Emit CPU prefetch hints over a range of the arena's storage.
@@ -539,22 +634,22 @@ public:
             warm_cache(locality, ioflags, (std::size_t)((std::byte*)ptr - base), sizeof(T));
     }
 
-    bool is_valid() const;                 ///< @return `true` if the arena holds valid storage.
-    bool empty() const;                    ///< @return `true` if nothing has been pushed yet.
+    bool is_valid() const noexcept;        ///< @return `true` if the arena holds valid storage.
+    bool empty() const noexcept;           ///< @return `true` if nothing has been pushed yet.
 
-    std::size_t used() const;              ///< @return Bytes currently in use.
-    std::size_t capacity() const;          ///< @return Total capacity in bytes.
-    std::size_t remaining() const;         ///< @return Bytes still available.
-    std::size_t count() const;             ///< @return Live array/string allocation count.
-    std::size_t total() const;             ///< @return Lifetime array/string allocation count.
-    memory_source source() const;          ///< @return The arena's @ref memory_source.
+    std::size_t used() const noexcept;     ///< @return Bytes currently in use.
+    std::size_t capacity() const noexcept; ///< @return Total capacity in bytes.
+    std::size_t remaining() const noexcept;///< @return Bytes still available.
+    std::size_t count() const noexcept;    ///< @return Live array/string allocation count.
+    std::size_t total() const noexcept;    ///< @return Lifetime array/string allocation count.
+    memory_source source() const noexcept; ///< @return The arena's @ref memory_source.
 
     /**
      * @brief Access the arena's underlying storage as a contiguous byte range.
      * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
      *         or an empty span if the arena holds no storage.
      */
-    std::span<std::byte> data() const;
+    std::span<std::byte> data() const noexcept;
 
     /**
      * @brief Carve out a sub-arena over a fixed region of this arena's storage.
