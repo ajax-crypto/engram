@@ -985,12 +985,6 @@ std::byte* arena::base_ptr() const
 // always max-aligned and every reservation advances the offset by a multiple of
 // this quantum, each returned address is suitably aligned for any standard type
 // and pop remains exact without tracking per-allocation padding.
-static constexpr std::size_t align_up_max(std::size_t n)
-{
-    constexpr std::size_t A = alignof(std::max_align_t);
-    return (n + (A - 1)) & ~(A - 1);
-}
-
 std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
 {
     assert(m_impl && "engram: cannot allocate from a moved-from arena");

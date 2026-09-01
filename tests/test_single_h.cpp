@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <string_view>
 
 #include <CppUTest/CommandLineTestRunner.h>
@@ -42,6 +43,57 @@ struct Tracked
 
 int Tracked::constructed = 0;
 int Tracked::destroyed = 0;
+
+struct NoDefault
+{
+    int value;
+    explicit NoDefault(int v) : value(v) {}
+};
+
+struct Boom : std::runtime_error
+{
+    Boom() : std::runtime_error("boom") {}
+};
+
+// Throws out of the constructor on the `throw_at`-th attempt.
+struct Fragile
+{
+    static int attempts;
+    static int live;
+    static int throw_at;
+
+    int value;
+
+    Fragile() : Fragile(0) {}
+
+    explicit Fragile(int v) : value(v)
+    {
+        if (attempts++ == throw_at)
+            throw Boom{};
+        ++live;
+    }
+
+    ~Fragile() { --live; }
+
+    static void reset(int at = -1) { attempts = 0; live = 0; throw_at = at; }
+};
+
+int Fragile::attempts = 0;
+int Fragile::live = 0;
+int Fragile::throw_at = -1;
+
+struct NoisyDtor
+{
+    static int destroyed;
+
+    ~NoisyDtor() noexcept(false)
+    {
+        ++destroyed;
+        throw Boom{};
+    }
+};
+
+int NoisyDtor::destroyed = 0;
 
 void fill(std::span<std::byte> bytes, unsigned char value)
 {
@@ -810,6 +862,235 @@ TEST(CustomBackend, FailedAllocatorLeavesAnInvalidArenaAndNoFreeHook)
         LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Element construction
+// ---------------------------------------------------------------------------
+TEST_GROUP(Construction)
+{
+    void setup() override { Tracked::reset(); }
+};
+
+TEST(Construction, PushConstructsTypesWithoutADefaultConstructor)
+{
+    auto a = arena::heap(4096);
+
+    auto& value = a.push<NoDefault>(7);
+
+    LONGS_EQUAL(7, value.value);
+}
+
+TEST(Construction, PushArrayWithoutArgsValueInitialisesNonTrivialTypes)
+{
+    auto a = arena::heap(4096);
+
+    auto span = a.push_array<Tracked>(4);
+
+    UNSIGNED_LONGS_EQUAL(4u, span.size());
+    LONGS_EQUAL(4, Tracked::constructed);
+    for (auto& element : span)
+        LONGS_EQUAL(0, element.value);
+
+    a.pop_array(span);
+    LONGS_EQUAL(4, Tracked::destroyed);
+}
+
+TEST(Construction, PushArrayLeavesTrivialTypesUninitialised)
+{
+    alignas(std::max_align_t) unsigned char storage[256];
+    std::memset(storage, 0x7E, sizeof(storage));
+    auto a = arena::adopt(storage, sizeof(storage));
+
+    auto span = a.push_array<int>(4);
+
+    UNSIGNED_LONGS_EQUAL(4u, span.size());
+    LONGS_EQUAL(0x7E7E7E7E, span[0]);
+}
+
+TEST(Construction, CompileTimeAndRuntimeArraysBehaveIdentically)
+{
+    auto a = arena::heap(4096);
+
+    auto fixed = a.push_array<4, Tracked>(5);
+    auto runtime = a.push_array<Tracked>(4, 5);
+
+    UNSIGNED_LONGS_EQUAL(fixed.size(), runtime.size());
+    LONGS_EQUAL(8, Tracked::constructed);
+    UNSIGNED_LONGS_EQUAL(2u * aligned(4 * sizeof(Tracked)), a.used());
+
+    a.pop_array(runtime);
+    a.pop_array(fixed);
+
+    LONGS_EQUAL(8, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#ifndef ENGRAM_MASK_EXCEPTIONS
+
+// ---------------------------------------------------------------------------
+// Exception safety (default: constructor exceptions propagate)
+// ---------------------------------------------------------------------------
+TEST_GROUP(ExceptionSafety)
+{
+    void setup() override { Fragile::reset(); }
+    void teardown() override { Fragile::reset(); }
+};
+
+TEST(ExceptionSafety, PushRethrowsAndRewinds)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+    auto count = a.count();
+
+    Fragile::reset(0);
+    CHECK_THROWS(Boom, (void)a.push<Fragile>(1));
+
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+    UNSIGNED_LONGS_EQUAL(count, a.count());
+    LONGS_EQUAL(0, Fragile::live);
+}
+
+TEST(ExceptionSafety, PushArrayRethrowsAndDestroysWhatItBuilt)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+    auto count = a.count();
+
+    Fragile::reset(3);
+    CHECK_THROWS(Boom, (void)a.push_array<Fragile>(8, 1));
+
+    LONGS_EQUAL(4, Fragile::attempts);
+    LONGS_EQUAL(0, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+    UNSIGNED_LONGS_EQUAL(count, a.count());
+}
+
+TEST(ExceptionSafety, CompileTimeSizedArrayRollsBackTheSameWay)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    Fragile::reset(2);
+    CHECK_THROWS(Boom, ((void)a.push_array<4, Fragile>(1)));
+
+    LONGS_EQUAL(0, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+}
+
+TEST(ExceptionSafety, ArenaStaysUsableAfterAThrow)
+{
+    auto a = arena::heap(4096);
+    auto& keep = a.push<int>(11);
+    auto anchor = a.used();
+
+    Fragile::reset(0);
+    CHECK_THROWS(Boom, (void)a.push_array<Fragile>(4, 1));
+    UNSIGNED_LONGS_EQUAL(anchor, a.used());
+
+    Fragile::reset();
+    auto span = a.push_array<Fragile>(4, 2);
+
+    UNSIGNED_LONGS_EQUAL(4u, span.size());
+    LONGS_EQUAL(4, Fragile::live);
+    for (auto& element : span)
+        LONGS_EQUAL(2, element.value);
+    LONGS_EQUAL(11, keep);
+
+    a.pop_array(span);
+    LONGS_EQUAL(0, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(anchor, a.used());
+}
+
+TEST(ExceptionSafety, SaveRestoreIsUnaffectedByAThrow)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    CHECK_TRUE(a.save());
+    Fragile::reset(2);
+    CHECK_THROWS(Boom, (void)a.push_array<Fragile>(6, 1));
+
+    UNSIGNED_LONGS_EQUAL(1u, a.save_depth());
+    CHECK_TRUE(a.restore());
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+}
+
+#else
+
+// ---------------------------------------------------------------------------
+// ENGRAM_MASK_EXCEPTIONS: no arena operation throws
+// ---------------------------------------------------------------------------
+TEST_GROUP(MaskedExceptions)
+{
+    void setup() override { Fragile::reset(); }
+    void teardown() override { Fragile::reset(); }
+};
+
+TEST(MaskedExceptions, PushSwallowsTheThrowAndKeepsTheSlot)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    Fragile::reset(0);
+    auto& value = a.push<Fragile>(1);
+    (void)value;
+
+    // Documented: the storage is reserved but may not hold a constructed object.
+    UNSIGNED_LONGS_EQUAL(before + aligned(sizeof(Fragile)), a.used());
+    LONGS_EQUAL(0, Fragile::live);
+}
+
+TEST(MaskedExceptions, PushArrayReturnsWhatItManagedToBuild)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    Fragile::reset(3);
+    auto span = a.push_array<Fragile>(8, 1);
+
+    UNSIGNED_LONGS_EQUAL(3u, span.size());
+    LONGS_EQUAL(3, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(before + aligned(3 * sizeof(Fragile)), a.used());
+
+    a.pop_array(span);
+
+    LONGS_EQUAL(0, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+}
+
+TEST(MaskedExceptions, PushArrayReturnsAnEmptySpanWhenNothingBuilds)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+    auto count = a.count();
+
+    Fragile::reset(0);
+    auto span = a.push_array<Fragile>(8, 1);
+
+    CHECK_TRUE(span.empty());
+    LONGS_EQUAL(0, Fragile::live);
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+    UNSIGNED_LONGS_EQUAL(count, a.count());
+}
+
+TEST(MaskedExceptions, ThrowingDestructorsAreIgnored)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    NoisyDtor::destroyed = 0;
+    auto& value = a.push<NoisyDtor>();
+    (void)value;
+
+    a.pop<NoisyDtor>();
+
+    LONGS_EQUAL(1, NoisyDtor::destroyed);
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+}
+
+#endif // ENGRAM_MASK_EXCEPTIONS
+#endif // exceptions enabled
 
 int main(int argc, char** argv)
 {

@@ -185,13 +185,15 @@ private:
     template <typename T, typename... ArgsT>
 	static bool initialize(std::byte* ptr, ArgsT&&... args)
 	{
+        static_assert(requires { T{ std::forward<ArgsT>(args)... }; } || std::is_constructible_v<T, ArgsT...>,
+            "engram: T cannot be constructed from the supplied arguments");
 #if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
         try {
 #endif
-            if constexpr (std::is_constructible_v<T>)
+            if constexpr (requires { T{ std::forward<ArgsT>(args)... }; })
                 new ((void*)ptr) T{ std::forward<ArgsT>(args)... };
-            else if constexpr (sizeof...(args) == 0 && !std::is_scalar_v<T> && std::is_default_constructible_v<T>)
-                new ((void*)ptr) T{};
+            else
+                new ((void*)ptr) T( std::forward<ArgsT>(args)... );
 #if defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
         }
         catch (...) {
@@ -215,6 +217,29 @@ private:
         catch (...) {
         }
 #endif
+    }
+
+    // Reservations are rounded up to the maximum fundamental alignment, so partial
+    // rollbacks have to be expressed in the same quantum to land on an exact offset.
+    static constexpr std::size_t align_up_max(std::size_t n)
+    {
+        constexpr std::size_t A = alignof(std::max_align_t);
+        return (n + (A - 1)) & ~(A - 1);
+    }
+
+    // ENGRAM_MASK_EXCEPTIONS: keep the `built` elements that were constructed and
+    // reclaim the rest of the reservation.
+    template <typename T>
+    std::span<T> truncate_array(T* base, std::size_t built, std::size_t size)
+    {
+        if (built == 0)
+        {
+            unreserve(align_up_max(sizeof(T) * size), true);
+            return {};
+        }
+
+        unreserve(align_up_max(sizeof(T) * size) - align_up_max(sizeof(T) * built), false);
+        return { base, built };
     }
 
     // ---- PIMPL bookkeeping helpers (defined in engram.cpp) ------------------
@@ -403,6 +428,7 @@ public:
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
 		auto slot = reserve(sizeof(T), true, false);
+        assert(slot && "engram: push() on an exhausted arena");
         if constexpr (!std::is_same_v<T, arena>)
         {
 #if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
@@ -430,35 +456,7 @@ public:
 	[[nodiscard]] std::span<T> push_array(ArgsT&&... args)
 	{
 		static_assert(size > 0);
-
-		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, false));
-		if (!valptr)
-			return {};
-		if constexpr (sizeof...(args) > 0)
-		{
-			auto ptr = valptr;
-			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-#if defined(ENGRAM_MASK_EXCEPTIONS)
-				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
-                {
-                    // The truncated array is still live, so it stays counted.
-                    unreserve(sizeof(T) * (size - idx), false);
-                    return { valptr, idx + 1u };
-                }
-#else
-                try {
-                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
-                } catch (...) {
-                    unreserve(sizeof(T) * size, true);
-                    throw;
-                }
-#endif
-#else
-                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
-#endif
-		}
-		return { valptr, size };
+		return push_array<T>(size, std::forward<ArgsT>(args)...);
 	}
 
     /** @brief Copy a compile-time-sized character array into the arena (NUL-terminated). */
@@ -488,6 +486,8 @@ public:
     /**
      * @brief Reserve a runtime-sized array of `T` and return it as a `std::span`.
      * @param size Element count.
+     * @param args Constructor arguments; when none are given, trivially default-constructible
+     *             elements are left uninitialized and everything else is value-initialized.
      */
     template <typename T, typename... ArgsT>
 	[[nodiscard]] std::span<T> push_array(std::size_t size, ArgsT&&... args)
@@ -497,31 +497,32 @@ public:
 		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, true));
 		if (!valptr)
 			return {};
-		if constexpr (sizeof...(args) > 0)
+
+		if constexpr (sizeof...(args) > 0 || !std::is_trivially_default_constructible_v<T>)
 		{
-			auto ptr = valptr;
-			for (std::size_t idx = 0; idx < size; ++idx, ++ptr)
-				#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+			for (std::size_t idx = 0; idx < size; ++idx)
+			{
+				auto slot = (std::byte*)(valptr + idx);
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
 #if defined(ENGRAM_MASK_EXCEPTIONS)
-				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
-                {
-                    // The truncated array is still live, so it stays counted.
-                    unreserve(sizeof(T) * (size - idx), false);
-                    return { valptr, idx + 1u };
-                }
+				if (!initialize<T>(slot, std::forward<ArgsT>(args)...))
+					return truncate_array<T>(valptr, idx, size);
 #else
-                try {
-                    initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
-                } catch (...) {
-                    unreserve(sizeof(T) * size, true);
-                    throw;
-                }
+				try {
+					initialize<T>(slot, std::forward<ArgsT>(args)...);
+				} catch (...) {
+					while (idx-- > 0)
+						release<T>((std::byte*)(valptr + idx));
+					unreserve(align_up_max(sizeof(T) * size), true);
+					throw;
+				}
 #endif
 #else
-                initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...);
+				initialize<T>(slot, std::forward<ArgsT>(args)...);
 #endif
+			}
 		}
-		return { valptr, (std::size_t)size };
+		return { valptr, size };
 	}
 
     /** @brief Copy a string view into the arena (NUL-terminated); returns a view of the copy. */

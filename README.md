@@ -252,6 +252,17 @@ a.pop_array(xs);                    // deduce the count from a std::span
 a.pop_array<256, float>();          // compile-time count
 ```
 
+The compile-time form forwards straight to the runtime one, so both behave
+identically. When you pass no constructor arguments, trivially default-constructible
+elements are left **uninitialized** (`push_array<float>(1024)` costs one pointer
+bump); anything with a real constructor is value-initialized, so `pop_array` always
+has live objects to destroy:
+
+```cpp
+auto raw   = a.push_array<float>(1024);   // uninitialized, no work per element
+auto nodes = a.push_array<Node>(16);      // 16 default-constructed Nodes
+```
+
 Define `ENGRAM_EASY_POP` and the arena remembers each array/string size (up to
 `ENGRAM_MAX_ARRAY_STACKSZ`, default 64), so you can pop without repeating it:
 
@@ -474,20 +485,25 @@ An exhausted arena also records `alloc_failed` when a `push_array` /
 `push_string` request does not fit, and returns an empty span or view.
 
 By default, exceptions thrown by the constructors of the objects you push are
-propagated: if an element's constructor throws, `push`/`push_array` roll back the
-reservation and rethrow, leaving the arena consistent (the basic exception guarantee).
+propagated. `push`/`push_array` give the **basic guarantee**: the elements that were
+already constructed are destroyed, the whole reservation is rolled back, and the
+exception is rethrown, so `used()`, `count()` and any pending save points are exactly
+what they were before the call and the arena stays usable.
 
 Define `ENGRAM_MASK_EXCEPTIONS` to make engram swallow those exceptions instead, so
 no arena operation ever throws:
 
 - `push<T>` never throws; a throwing constructor is caught and you receive a
-  reference to storage that may not hold a fully-constructed object.
-- `push_array` stops at the first element whose constructor throws, reclaims the
-  unused tail, and returns a truncated span.
+  reference to storage that may not hold a fully-constructed object. The slot stays
+  reserved.
+- `push_array` stops at the first element whose constructor throws, destroys nothing,
+  reclaims the reservation past that point, and returns a span over just the elements
+  it did construct — an empty span if the very first one threw.
 - Destructors invoked by `pop`/`pop_array`/`pop_string` that throw are ignored.
 
 The macro only takes effect when the compiler has exceptions enabled; with exceptions
-disabled it is a no-op (engram emits no `try`/`catch`).
+disabled it is a no-op (engram emits no `try`/`catch`). Freestanding builds define it
+automatically — see [Freestanding Builds](#freestanding-builds).
 
 ## Optional Backends
 
@@ -706,7 +722,9 @@ the cases the compiler doesn't advertise.
 The macro force-`#undef`s every `ENGRAM_ENABLE_*` backend switch (plus
 `ENGRAM_ALL` and the Metal macros), so it always wins over anything your build
 system passes in. It also implies `ENGRAM_DISABLE_PMR`, since
-`std::pmr::monotonic_buffer_resource` is a hosted facility. No OS header
+`std::pmr::monotonic_buffer_resource` is a hosted facility, and
+`ENGRAM_MASK_EXCEPTIONS`, since there is rarely anything out here to catch a
+throwing constructor. No OS header
 (`<sys/mman.h>`, `<pthread.h>`, `<windows.h>`, …) is included.
 
 **What you keep:** stack and adopted arenas, and every arena feature built on
@@ -832,14 +850,16 @@ sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
 
 | Test file                                                    | Build under test                                       |
 | ------------------------------------------------------------ | ------------------------------------------------------ |
-| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL)              |
-| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`                               |
+| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built twice — with and without `ENGRAM_MASK_EXCEPTIONS` |
+| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, built twice — with and without `ENGRAM_MASK_EXCEPTIONS` |
 | [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
 
 Coverage spans the allocation flags, each `memory_source` (including real
 `ENGRAM_STACK_ARENA` storage, which the macro makes testable), `arena_error`
-reporting, push/pop and array/string round-trips (including destructor calls,
-alignment, allocation counting and exhaustion), partitions, and save/restore. The
+reporting, element construction, push/pop and array/string round-trips (including
+destructor calls, alignment, allocation counting and exhaustion), partitions,
+save/restore, and both exception policies — rollback-and-rethrow by default,
+truncated spans and swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The
 freestanding suite additionally `static_assert`s that the hosted surface
 (`arena::heap`, `arena::stack`, `arena::unpin`, `arena::sync`) is genuinely gone.
 `test_single_h.cpp` uses CppUTestExt's mocking to stand up a fake backend and

@@ -63,6 +63,19 @@ engram_add_test(engram_test_single_h
     DEFINES  ${ENGRAM_DEFINITIONS}
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
+# Same suites again with the exception-masking policy selected.
+engram_add_test(engram_test_hcpp_masked
+    SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_MASK_EXCEPTIONS
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_single_h_masked
+    SOURCES  test_single_h.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_MASK_EXCEPTIONS
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
 engram_add_test(engram_test_freestanding
     SOURCES  test_freestanding.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header

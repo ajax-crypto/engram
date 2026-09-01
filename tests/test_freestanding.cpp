@@ -27,6 +27,10 @@ namespace flags = engram::flags;
 #error "test_freestanding.cpp must be compiled with ENGRAM_ENABLE_FREESTANDING"
 #endif
 
+#ifndef ENGRAM_MASK_EXCEPTIONS
+#error "a freestanding build must imply ENGRAM_MASK_EXCEPTIONS"
+#endif
+
 namespace {
 
 constexpr std::size_t kAlign = alignof(std::max_align_t);
