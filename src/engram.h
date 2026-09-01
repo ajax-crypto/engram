@@ -14,6 +14,7 @@
 #include <span>
 #include <string_view>
 #include <new>
+#include <array>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -22,10 +23,14 @@
 #endif
 
 #ifdef ENGRAM_EASY_POP
-#include <array>
 #ifndef ENGRAM_MAX_ARRAY_STACKSZ
 #define ENGRAM_MAX_ARRAY_STACKSZ 64
 #endif
+#endif
+
+/** @brief Depth of the fixed save-point stack used by @ref engram::arena::save. */
+#ifndef ENGRAM_MAX_SAVE_STACKSZ
+#define ENGRAM_MAX_SAVE_STACKSZ 32
 #endif
 
 #ifdef _WIN32
@@ -582,6 +587,28 @@ public:
      * after you have already popped whatever needs cleanup.
      */
     void reset() noexcept;
+
+    /**
+     * @brief Push the current head onto the save stack (an implicit sub-arena marker).
+     * @details Save points nest LIFO and are held in a fixed array of
+     * `ENGRAM_MAX_SAVE_STACKSZ` (default 32) entries; define that macro before
+     * including engram.h to change the depth.
+     * @return `false` if the save stack is full.
+     */
+    bool save() noexcept;
+
+    /**
+     * @brief Rewind to the most recent @ref save point, discarding everything pushed since.
+     * @details Zeroes `[saved offset, current offset)` unless the arena was created
+     * with `flags::no_clear` (device / `memory_source::custom` arenas are never
+     * host-cleared), then restores the head and the allocation bookkeeping to their
+     * saved values. Like @ref reset it runs no destructors.
+     * @return `false` if no save point is pending.
+     */
+    bool restore() noexcept;
+
+    /** @return Number of save points currently pending. */
+    std::size_t save_depth() const noexcept;
 
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin();

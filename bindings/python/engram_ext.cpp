@@ -177,6 +177,14 @@ PYBIND11_MODULE(_engram, m)
              "Synchronize a device-backed arena (no-op for host arenas).")
         .def("reset", &arena::reset,
              "Reclaim all storage in O(1), resetting the arena to empty (runs no destructors).")
+        .def("save", &arena::save,
+             "Record the current head so a later restore() rewinds to it. Save points nest "
+             "LIFO; returns False if the save stack (ENGRAM_MAX_SAVE_STACKSZ) is full.")
+        .def("restore", &arena::restore,
+             "Rewind to the most recent save point, zeroing everything pushed since. "
+             "Returns False if no save point is pending.")
+        .def_property_readonly("save_depth", &arena::save_depth,
+                               "Number of save points currently pending.")
         .def("unpin", &arena::unpin, "Release pages pinned via flags::pin_to_physical.")
 
         // ---- introspection -------------------------------------------------

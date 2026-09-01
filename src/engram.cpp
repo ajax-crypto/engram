@@ -151,25 +151,60 @@
 #endif
 #endif
 
+// _mm_prefetch and __builtin_prefetch both require constant hint arguments, so the runtime
+// rw / locality pair is dispatched to a call with literal hints here.
 #ifdef _MSC_VER
 #define StackAllocate(sz) _alloca(sz)
 #include <intrin.h> // Required for MSVC intrinsics
+namespace engram::detail {
+inline void prefetch_hint(const void* addr, int rw, int locality)
+{
+    (void)rw;
 #if defined(_M_ARM) || defined(_M_ARM64)
-    #define PrefetchIntoCache(addr, rw, locality) __prefetch(addr)
+    (void)locality;
+    __prefetch(addr);
 #else
-    #define PrefetchIntoCache(addr, rw, locality) \
-        _mm_prefetch((const char*)(addr), \
-        ((locality) == 3) ? _MM_HINT_T0 : \
-        ((locality) == 2) ? _MM_HINT_T1 : \
-        ((locality) == 1) ? _MM_HINT_T2 : _MM_HINT_NTA)
+    switch (locality)
+    {
+        case 3:  _mm_prefetch((const char*)addr, _MM_HINT_T0); break;
+        case 2:  _mm_prefetch((const char*)addr, _MM_HINT_T1); break;
+        case 1:  _mm_prefetch((const char*)addr, _MM_HINT_T2); break;
+        default: _mm_prefetch((const char*)addr, _MM_HINT_NTA); break;
+    }
 #endif
+}
+}
+#define PrefetchIntoCache(addr, rw, locality) \
+    ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #elif __GNUC__
 #define StackAllocate(sz) __builtin_alloca(sz)
-#define PrefetchIntoCache(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+namespace engram::detail {
+inline void prefetch_hint(const void* addr, int rw, int locality)
+{
+    if (rw)
+        switch (locality)
+        {
+            case 3:  __builtin_prefetch(addr, 1, 3); break;
+            case 2:  __builtin_prefetch(addr, 1, 2); break;
+            case 1:  __builtin_prefetch(addr, 1, 1); break;
+            default: __builtin_prefetch(addr, 1, 0); break;
+        }
+    else
+        switch (locality)
+        {
+            case 3:  __builtin_prefetch(addr, 0, 3); break;
+            case 2:  __builtin_prefetch(addr, 0, 2); break;
+            case 1:  __builtin_prefetch(addr, 0, 1); break;
+            default: __builtin_prefetch(addr, 0, 0); break;
+        }
+}
+}
+#define PrefetchIntoCache(addr, rw, locality) \
+    ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #else
 #warning "StackAllocate and PrefetchIntoCache macros are not defined for this compiler. Please define them appropriately."
 #define StackAllocate(sz)
-#define PrefetchIntoCache(addr, rw, locality)
+#define PrefetchIntoCache(addr, rw, locality) ((void)(addr), (void)(rw), (void)(locality))
 #endif
 
 #ifdef ENGRAM_UNIX_ENV
@@ -236,6 +271,20 @@ struct impl_data
     std::array<std::pair<std::byte*, std::size_t>, ENGRAM_MAX_ARRAY_STACKSZ> m_array_sizes;
     std::size_t m_array_stacksz = 0;
 #endif
+
+    // One entry per pending arena::save(); restore() rewinds to the newest one.
+    struct save_point
+    {
+        std::size_t offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+        std::size_t count;
+#endif
+#ifdef ENGRAM_EASY_POP
+        std::size_t array_stacksz;
+#endif
+    };
+    std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
+    std::size_t m_save_stacksz = 0;
 
 	void* m_extra = nullptr;
     bool m_use_sys_free = false;
@@ -454,7 +503,7 @@ static std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
         try {
 #endif
-		    memory = new (std::align_val_t{alignment}) std::byte[size];
+		    memory = ::operator new[](size, std::align_val_t{alignment});
 		    isStdLib = true;
             if ((flags & engram::flags::pin_to_physical) != 0)
                 mlock(memory, size);
@@ -550,7 +599,7 @@ static std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
         try {
 #endif
-		    memory = new (std::align_val_t{alignment}) std::byte[size];
+		    memory = ::operator new[](size, std::align_val_t{alignment});
 		    isStdLib = true;
 
 #if defined(__cpp_exceptions) || defined(_CPPUNWIND)
@@ -1079,10 +1128,51 @@ void arena::reset() noexcept
 #ifdef ENGRAM_EASY_POP
     d.m_array_stacksz = 0;
 #endif
+    d.m_save_stacksz = 0;
 #ifndef ENGRAM_DISABLE_PMR
     d.m_pmr.reset();
 #endif
 }
+
+bool arena::save() noexcept
+{
+    auto& d = *m_impl;
+    if (d.m_save_stacksz >= d.m_save_stack.size())
+        return false;
+
+    auto& sp = d.m_save_stack[d.m_save_stacksz++];
+    sp.offset = d.m_offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+    sp.count = d.m_count;
+#endif
+#ifdef ENGRAM_EASY_POP
+    sp.array_stacksz = d.m_array_stacksz;
+#endif
+    return true;
+}
+
+bool arena::restore() noexcept
+{
+    auto& d = *m_impl;
+    if (d.m_save_stacksz == 0)
+        return false;
+
+    const auto& sp = d.m_save_stack[--d.m_save_stacksz];
+    // Device storage may not be addressable from the host, so never memset it here.
+    if (d.m_ptr && d.m_clear_on_free && (d.m_type != memory_source::custom) && (d.m_offset > sp.offset))
+        memset(d.m_ptr + sp.offset, 0, d.m_offset - sp.offset);
+
+    d.m_offset = sp.offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+    d.m_count = sp.count;
+#endif
+#ifdef ENGRAM_EASY_POP
+    d.m_array_stacksz = sp.array_stacksz;
+#endif
+    return true;
+}
+
+std::size_t arena::save_depth() const noexcept { return m_impl->m_save_stacksz; }
 
 void arena::unpin()
 {

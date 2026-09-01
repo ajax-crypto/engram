@@ -1,4 +1,6 @@
 #pragma once
+#ifndef ENGRAM_H_INCLUDED
+#define ENGRAM_H_INCLUDED
 
 /**
  * @file engram.h
@@ -30,11 +32,17 @@
 #include <memory_resource>
 #endif
 
-#ifdef ENGRAM_EASY_POP
 #include <array>
+
+#ifdef ENGRAM_EASY_POP
 #ifndef ENGRAM_MAX_ARRAY_STACKSZ
 #define ENGRAM_MAX_ARRAY_STACKSZ 64
 #endif
+#endif
+
+/** @brief Depth of the fixed save-point stack used by @ref engram::arena::save. */
+#ifndef ENGRAM_MAX_SAVE_STACKSZ
+#define ENGRAM_MAX_SAVE_STACKSZ 32
 #endif
 
 #ifdef _WIN32
@@ -207,25 +215,60 @@
 #endif
 #endif
 
+// _mm_prefetch and __builtin_prefetch both require constant hint arguments, so the runtime
+// rw / locality pair is dispatched to a call with literal hints here.
 #ifdef _MSC_VER
 #define StackAllocate(sz) _alloca(sz)
 #include <intrin.h> // Required for MSVC intrinsics
+namespace engram::detail {
+inline void prefetch_hint(const void* addr, int rw, int locality)
+{
+    (void)rw;
 #if defined(_M_ARM) || defined(_M_ARM64)
-    #define PrefetchIntoCache(addr, rw, locality) __prefetch(addr)
+    (void)locality;
+    __prefetch(addr);
 #else
-    #define PrefetchIntoCache(addr, rw, locality) \
-        _mm_prefetch((const char*)(addr), \
-        ((locality) == 3) ? _MM_HINT_T0 : \
-        ((locality) == 2) ? _MM_HINT_T1 : \
-        ((locality) == 1) ? _MM_HINT_T2 : _MM_HINT_NTA)
+    switch (locality)
+    {
+        case 3:  _mm_prefetch((const char*)addr, _MM_HINT_T0); break;
+        case 2:  _mm_prefetch((const char*)addr, _MM_HINT_T1); break;
+        case 1:  _mm_prefetch((const char*)addr, _MM_HINT_T2); break;
+        default: _mm_prefetch((const char*)addr, _MM_HINT_NTA); break;
+    }
 #endif
+}
+}
+#define PrefetchIntoCache(addr, rw, locality) \
+    ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #elif __GNUC__
 #define StackAllocate(sz) __builtin_alloca(sz)
-#define PrefetchIntoCache(addr, rw, locality) __builtin_prefetch(addr, rw, locality)
+namespace engram::detail {
+inline void prefetch_hint(const void* addr, int rw, int locality)
+{
+    if (rw)
+        switch (locality)
+        {
+            case 3:  __builtin_prefetch(addr, 1, 3); break;
+            case 2:  __builtin_prefetch(addr, 1, 2); break;
+            case 1:  __builtin_prefetch(addr, 1, 1); break;
+            default: __builtin_prefetch(addr, 1, 0); break;
+        }
+    else
+        switch (locality)
+        {
+            case 3:  __builtin_prefetch(addr, 0, 3); break;
+            case 2:  __builtin_prefetch(addr, 0, 2); break;
+            case 1:  __builtin_prefetch(addr, 0, 1); break;
+            default: __builtin_prefetch(addr, 0, 0); break;
+        }
+}
+}
+#define PrefetchIntoCache(addr, rw, locality) \
+    ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #else
 #warning "StackAllocate and PrefetchIntoCache macros are not defined for this compiler. Please define them appropriately."
 #define StackAllocate(sz)
-#define PrefetchIntoCache(addr, rw, locality)
+#define PrefetchIntoCache(addr, rw, locality) ((void)(addr), (void)(rw), (void)(locality))
 #endif
 
 #ifdef ENGRAM_UNIX_ENV
@@ -269,315 +312,6 @@ typedef enum { MTLResourceStorageModeShared = 0 << 4 } MTLResourceOptions;
 namespace engram {
 
 class arena;
-
-#ifdef ENGRAM_ENABLE_DX12
-using Microsoft::WRL::ComPtr;
-#endif
-
-namespace vendor {
-
-#if __APPLE__
-
-void free_metal(arena& arena);
-
-#ifdef ENGRAM_METAL_CPP
-void allocate_metal(arena& arena, MTL::Device* device, int32_t flags);
-#else
-void allocate_metal(arena& arena, id device, int32_t flags);
-#endif
-
-#endif
-
-#ifdef ENGRAM_ENABLE_VULKAN
-struct vk_mem_tracker
-{
-	VkDevice& device;
-	VkBuffer& buffer;
-	VkDeviceMemory& memory;
-};
-inline static std::unordered_map<std::byte*, vk_mem_tracker> vk_mem_info_map;
-
-void free_vulkan(arena& arena);
-void allocate_vulkan(arena& arena, VkDevice& device);
-#endif
-
-#ifdef ENGRAM_ENABLE_DX12
-inline static std::unordered_map<std::byte*, ComPtr<ID3D12Resource>> dx12_mem_info_map;
-
-void free_dx12(arena& arena);
-void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLAGS descflags, D3D12_RESOURCE_STATES resflags , int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_CUDA
-void free_cuda(arena& arena);
-void allocate_cuda(arena& arena, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_ROCM
-void free_rocm(arena& arena);
-void allocate_rocm(arena& arena, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_OPENCL
-inline static std::unordered_map<std::byte*, cl_context> opencl_mem_info_map;
-
-void free_opencl(arena& arena);
-void allocate_opencl(arena& arena, cl_context context, cl_svm_mem_flags clflags, cl_uint alignment, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_XDNA
-inline static std::unordered_map<std::byte*, xrtBufferHandle> xdna_buffer_mapping;
-	
-void free_xdna(arena& arena);
-void allocate_xdna(xrtDeviceHandle device, xrtBufferFlags xoflags, xrtMemoryGroup group, arena& arena, int32_t flags);
-xrtBufferHandle get_xrt_buffer_handle(arena& arena);
-#endif
-
-#ifdef ENGRAM_ENABLE_DPDK
-inline static std::unordered_map<std::byte*, const rte_memzone*> dpdk_mem_zone_mapping;
-
-void free_dpdk(arena& arena);
-void allocate_dpdk(std::string_view name, int align, int socketId, unsigned int dpdkFlags, bool useVirtAddr, arena& arena, int32_t flags);
-const rte_memzone* get_rte_mem_zone(arena& arena);
-#endif
-
-#ifdef ENGRAM_ENABLE_OP_TEE
-
-void free_op_tee(arena& arena);
-void allocate_op_tee(arena& arena, uint32_t hint, int32_t flags);
-
-#endif
-
-#ifdef ENGRAM_ENABLE_SYCL
-inline static std::unordered_map<std::byte*, sycl::queue> sycl_mem_info_map;
-
-void free_sycl(arena& arena);
-void allocate_sycl(arena& arena, sycl::queue& queue, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_LEVEL_ZERO
-inline static std::unordered_map<std::byte*, ze_context_handle_t> level_zero_mem_info_map;
-
-void free_level_zero(arena& arena);
-void allocate_level_zero(arena& arena, ze_context_handle_t context, ze_device_handle_t device, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_WEBGPU
-inline static std::unordered_map<std::byte*, WGPUBuffer> webgpu_mem_info_map;
-
-void free_webgpu(arena& arena);
-void allocate_webgpu(arena& arena, WGPUDevice device, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_PMDK
-inline static std::unordered_map<std::byte*, std::pair<std::size_t, bool>> pmdk_map_info;   // { mapped_len, is_pmem }
-
-void free_pmdk(arena& arena);
-void allocate_pmdk(arena& arena, const char* path, int pmdk_flags, mode_t mode, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_RDMA
-inline static std::unordered_map<std::byte*, ibv_mr*> rdma_mr_map;
-
-void free_rdma(arena& arena);
-void allocate_rdma(arena& arena, void* buffer, ibv_pd* pd, int access, int32_t flags);
-ibv_mr* get_rdma_mr(arena& arena);
-#endif
-
-#ifdef ENGRAM_ENABLE_GPUDIRECT
-void free_gpudirect(arena& arena);
-void allocate_gpudirect(arena& arena, int32_t flags);
-#endif
-
-#ifdef ENGRAM_ENABLE_DMABUF
-inline static std::unordered_map<std::byte*, int> dmabuf_fd_map;   // ptr -> dma-buf fd
-
-void free_dmabuf(arena& arena);
-void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags);
-#endif
-
-} // namespace vendor
-
-#ifdef ENGRAM_UNIX_ENV
-
-std::size_t get_total_stack_space()
-{
-	pthread_attr_t attr;
-    void *stack_base;
-    std::size_t stack_size;
-
-    pthread_getattr_np(pthread_self(), &attr);
-    pthread_attr_getstack(&attr, &stack_base, &stack_size);
-    pthread_attr_destroy(&attr);
-	
-	return stack_size;
-}
-
-std::size_t get_page_size()
-{
-    auto pagesz = sysconf(_SC_PAGESIZE);
-    return pagesz == -1 ? ENGRAM_FALLBACK_PAGESZ : pagesz;
-}
-
-std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
-{
-    auto shared = (flags & (engram::flags::shared | engram::flags::unified)) != 0;
-    auto contiguous = (flags & engram::flags::true_contiguous) != 0;
-
-	if (shared || contiguous)
-	{
-        auto fd = 
-#ifdef __linux__
-		    (flags & engram::flags::unified) ? fd : -1;
-#else
-            -1;
-#endif
-#ifdef __APPLE__
-            MAP_ANON | 
-#else
-            MAP_ANONYMOUS | 
-#endif
-#if defined(BSD)
-            (contiguous ? MAP_ALIGNED_SUPER : 0) | 
-#elif __linux__
-            (contiguous ? MAP_HUGETLB : 0) | 
-#else
-            0 |
-#endif
-            (shared ? MAP_SHARED : MAP_PRIVATE);
-		void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, 
-#ifdef __APPLE__
-            contiguous ? VM_FLAGS_SUPERPAGE_SIZE_2MB : -1, 
-#else
-            fd,
-#endif
-            0);
-		if (addr == MAP_FAILED) return { nullptr, false };
-        if ((flags & engram::flags::pin_to_physical) != 0)
-            mlock(addr, size);
-		return { (std::byte*)addr, true };
-	}
-	else
-    {
-        auto isStdLib = false;
-        void* memory = nullptr;
-
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-        try {
-#endif
-		    memory = new (std::align_val_t{alignment}) std::byte[size];
-		    isStdLib = true;
-            if ((flags & engram::flags::pin_to_physical) != 0)
-                mlock(addr, size);
-
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-        }
-        catch (const std::bad_alloc&) {
-            memory = nullptr;
-        }
-#endif
-		return { memory, !isStdLib };
-    }
-}
-#elif _WIN32
-
-std::size_t get_total_stack_space()
-{
-	ULONG_PTR low_limit, high_limit;
-    GetCurrentThreadStackLimits(&low_limit, &high_limit);
-    auto pagesz = high_limit - low_limit;
-    return pagesz > 0 ? pagesz : ENGRAM_FALLBACK_PAGESZ;
-}
-
-std::size_t get_page_size()
-{
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return si.dwPageSize;
-}
-
-void* allocate_contiguous(std::size_t size)
-{
-    HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-        return nullptr;
-    }
-
-    TOKEN_PRIVILEGES tp;
-    LUID luid;
-    if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
-        CloseHandle(hToken);
-        return nullptr;
-    }
-
-    tp.PrivilegeCount = 1;
-    tp.Privileges[0].Luid = luid;
-    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    // AdjustTokenPrivileges returns TRUE even if some privileges aren't adjusted. 
-    // Always check GetLastError() afterward.
-    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL) || 
-        GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        CloseHandle(hToken);
-        return nullptr;
-    }
-
-    CloseHandle(hToken);
-
-    MEM_EXTENDED_PARAMETER extendedParam = {};
-    extendedParam.Type = MemExtendedParameterAttributeFlags;
-    extendedParam.ULong64 = MEM_EXTENDED_PARAMETER_NONPAGED_HUGE;
-    void* pBuffer = VirtualAlloc2(
-        GetCurrentProcess(),                                // Process handle
-        NULL,                                               // Base address (let OS choose)
-        size,                                               // Size of allocation
-        MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,         // Allocation flags
-        PAGE_READWRITE,                                     // Page protection
-        &extendedParam,                                     // Pointer to extended parameters
-        1                                                   // Parameter count
-    );
-
-    return pBuffer;
-}
-
-std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
-{
-    (void)fd;
-	void* memory = nullptr;
-	auto isStdLib = false;
-	if (flags & engram::flags::true_contiguous) 
-		memory = allocate_contiguous(size);
-	else if (flags & engram::flags::shared)
-		memory = VirtualAlloc2(
-			GetCurrentProcess(),
-			NULL,
-			size,
-			MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-			PAGE_NOACCESS,
-			NULL, 0
-		);
-	else
-	{
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-        try {
-#endif
-		    memory = new (std::align_val_t{alignment}) std::byte[size];
-		    isStdLib = true;
-
-#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
-        }
-        catch (const std::bad_alloc&) {
-            memory = nullptr;
-        }
-#endif
-	}
-
-    if (flags & engram::flags::pin_to_physical)
-        VirtualLock(memory, size);
-	
-	return { (std::byte*)memory, !isStdLib };
-}
-#endif
 
 /** @brief Where an arena's memory comes from. */
 enum class memory_source
@@ -626,34 +360,140 @@ namespace flags
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).
 }
 
-void heap_allocate(arena& arena, int32_t flags, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
-{
-	std::tie(arena.m_ptr, arena.m_use_sys_free) = heap_allocate_impl(arena.m_size, flags, alignment, fd);
-    arena.m_alignment = alignment;
-    if (arena.m_ptr == nullptr)
-        arena.m_error = arena_error::alloc_failed;
-    else
-        arena.m_type = memory_source::heap;
-}
-
-void heap_free(arena& arena)
-{
-    if (arena.m_ptr)
-    {
-        if (arena.m_clear_on_free)
-            memset(arena.m_ptr, 0, arena.m_size);
-
-        if (arena.m_use_sys_free)
-#ifdef _WIN32
-            VirtualFree((void*)arena.m_ptr, 0, MEM_RELEASE);
-#elif ENGRAM_UNIX_ENV
-            munmap((void*)arena.m_ptr, arena.m_size);
+#ifdef ENGRAM_ENABLE_DX12
+using Microsoft::WRL::ComPtr;
 #endif
-        else
-            ::operator delete[](arena.m_ptr, std::align_val_t{arena.m_alignment});
-        arena.m_ptr = nullptr;
-    }
-}
+
+namespace vendor {
+
+#if __APPLE__
+
+inline void free_metal(arena& arena);
+
+#ifdef ENGRAM_METAL_CPP
+inline void allocate_metal(arena& arena, MTL::Device* device, int32_t flags);
+#else
+inline void allocate_metal(arena& arena, id device, int32_t flags);
+#endif
+
+#endif
+
+#ifdef ENGRAM_ENABLE_VULKAN
+struct vk_mem_tracker
+{
+	VkDevice& device;
+	VkBuffer& buffer;
+	VkDeviceMemory& memory;
+};
+inline std::unordered_map<std::byte*, vk_mem_tracker> vk_mem_info_map;
+
+inline void free_vulkan(arena& arena);
+inline void allocate_vulkan(arena& arena, VkDevice& device);
+#endif
+
+#ifdef ENGRAM_ENABLE_DX12
+inline std::unordered_map<std::byte*, ComPtr<ID3D12Resource>> dx12_mem_info_map;
+
+inline void free_dx12(arena& arena);
+inline void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLAGS descflags, D3D12_RESOURCE_STATES resflags , int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_CUDA
+inline void free_cuda(arena& arena);
+inline void allocate_cuda(arena& arena, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_ROCM
+inline void free_rocm(arena& arena);
+inline void allocate_rocm(arena& arena, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_OPENCL
+inline std::unordered_map<std::byte*, cl_context> opencl_mem_info_map;
+
+inline void free_opencl(arena& arena);
+inline void allocate_opencl(arena& arena, cl_context context, cl_svm_mem_flags clflags, cl_uint alignment, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_XDNA
+inline std::unordered_map<std::byte*, xrtBufferHandle> xdna_buffer_mapping;
+	
+inline void free_xdna(arena& arena);
+inline void allocate_xdna(xrtDeviceHandle device, xrtBufferFlags xoflags, xrtMemoryGroup group, arena& arena, int32_t flags);
+inline xrtBufferHandle get_xrt_buffer_handle(arena& arena);
+#endif
+
+#ifdef ENGRAM_ENABLE_DPDK
+inline std::unordered_map<std::byte*, const rte_memzone*> dpdk_mem_zone_mapping;
+
+inline void free_dpdk(arena& arena);
+inline void allocate_dpdk(std::string_view name, int align, int socketId, unsigned int dpdkFlags, bool useVirtAddr, arena& arena, int32_t flags);
+inline const rte_memzone* get_rte_mem_zone(arena& arena);
+#endif
+
+#ifdef ENGRAM_ENABLE_OP_TEE
+
+inline void free_op_tee(arena& arena);
+inline void allocate_op_tee(arena& arena, uint32_t hint, int32_t flags);
+
+#endif
+
+#ifdef ENGRAM_ENABLE_SYCL
+inline std::unordered_map<std::byte*, sycl::queue> sycl_mem_info_map;
+
+inline void free_sycl(arena& arena);
+inline void allocate_sycl(arena& arena, sycl::queue& queue, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_LEVEL_ZERO
+inline std::unordered_map<std::byte*, ze_context_handle_t> level_zero_mem_info_map;
+
+inline void free_level_zero(arena& arena);
+inline void allocate_level_zero(arena& arena, ze_context_handle_t context, ze_device_handle_t device, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_WEBGPU
+inline std::unordered_map<std::byte*, WGPUBuffer> webgpu_mem_info_map;
+
+inline void free_webgpu(arena& arena);
+inline void allocate_webgpu(arena& arena, WGPUDevice device, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_PMDK
+inline std::unordered_map<std::byte*, std::pair<std::size_t, bool>> pmdk_map_info;   // { mapped_len, is_pmem }
+
+inline void free_pmdk(arena& arena);
+inline void allocate_pmdk(arena& arena, const char* path, int pmdk_flags, mode_t mode, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_RDMA
+inline std::unordered_map<std::byte*, ibv_mr*> rdma_mr_map;
+
+inline void free_rdma(arena& arena);
+inline void allocate_rdma(arena& arena, void* buffer, ibv_pd* pd, int access, int32_t flags);
+inline ibv_mr* get_rdma_mr(arena& arena);
+#endif
+
+#ifdef ENGRAM_ENABLE_GPUDIRECT
+inline void free_gpudirect(arena& arena);
+inline void allocate_gpudirect(arena& arena, int32_t flags);
+#endif
+
+#ifdef ENGRAM_ENABLE_DMABUF
+inline std::unordered_map<std::byte*, int> dmabuf_fd_map;   // ptr -> dma-buf fd
+
+inline void free_dmabuf(arena& arena);
+inline void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags);
+#endif
+
+} // namespace vendor
+
+// Platform primitives and the heap backend. `heap_allocate` / `heap_free` need a complete
+// `arena`, so the whole block is defined after the class and only declared here.
+inline std::size_t get_total_stack_space();
+inline std::size_t get_page_size();
+inline void heap_allocate(arena& arena, int32_t flags, std::size_t alignment = alignof(std::max_align_t), int fd = -1);
+inline void heap_free(arena& arena);
 
 /**
  * @brief Emit CPU prefetch hints for `sizeof(T)`-aligned data at @p ptr.
@@ -682,7 +522,6 @@ bool prefetch(T* ptr, std::size_t size)
     
     if (ptr && size > 0)
     {
-        PrefetchIntoCache(ptr, 0, static_cast<int>(cache_locality::global));
     #ifdef ENGRAM_UNIX_ENV
 #ifdef __linux__
             ok = madvise(ptr, size, MADV_WILLNEED) == 0;
@@ -840,6 +679,20 @@ public:
     std::array<std::pair<std::byte*, std::size_t>, ENGRAM_MAX_ARRAY_STACKSZ> m_array_sizes;
     std::size_t m_array_stacksz = 0;
 #endif
+
+    // One entry per pending save(); restore() rewinds to the newest one.
+    struct save_point
+    {
+        std::size_t offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+        std::size_t count;
+#endif
+#ifdef ENGRAM_EASY_POP
+        std::size_t array_stacksz;
+#endif
+    };
+    std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
+    std::size_t m_save_stacksz = 0;
 
 	void* m_extra = nullptr;
     bool m_use_sys_free = false;
@@ -1379,6 +1232,8 @@ public:
         m_array_sizes = std::move(other.m_array_sizes);
         m_array_stacksz = other.m_array_stacksz;
 #endif
+        m_save_stack = other.m_save_stack;
+        m_save_stacksz = other.m_save_stacksz;
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
         other.m_pmr.reset();
@@ -1405,6 +1260,8 @@ public:
         m_array_sizes = std::move(other.m_array_sizes);
         m_array_stacksz = other.m_array_stacksz;
 #endif
+        m_save_stack = other.m_save_stack;
+        m_save_stacksz = other.m_save_stacksz;
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
         other.m_pmr.reset();
@@ -1688,10 +1545,65 @@ public:
 #ifdef ENGRAM_EASY_POP
         m_array_stacksz = 0;
 #endif
+        m_save_stacksz = 0;
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
 #endif
     }
+
+    /**
+     * @brief Push the current head onto the save stack (an implicit sub-arena marker).
+     * @details Save points nest LIFO and are held in a fixed array of
+     * `ENGRAM_MAX_SAVE_STACKSZ` (default 32) entries; define that macro before
+     * including engram.h to change the depth.
+     * @return `false` if the save stack is full.
+     */
+    bool save() noexcept
+    {
+        if (m_save_stacksz >= m_save_stack.size())
+            return false;
+
+        auto& sp = m_save_stack[m_save_stacksz++];
+        sp.offset = m_offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+        sp.count = m_count;
+#endif
+#ifdef ENGRAM_EASY_POP
+        sp.array_stacksz = m_array_stacksz;
+#endif
+        return true;
+    }
+
+    /**
+     * @brief Rewind to the most recent @ref save point, discarding everything pushed since.
+     * @details Zeroes `[saved offset, current offset)` unless the arena was created
+     * with `flags::no_clear` (device / `memory_source::custom` arenas are never
+     * host-cleared), then restores the head and the allocation bookkeeping to their
+     * saved values. Like @ref reset it runs no destructors.
+     * @return `false` if no save point is pending.
+     */
+    bool restore() noexcept
+    {
+        if (m_save_stacksz == 0)
+            return false;
+
+        const auto& sp = m_save_stack[--m_save_stacksz];
+        // Device storage may not be addressable from the host, so never memset it here.
+        if (m_ptr && m_clear_on_free && (m_type != memory_source::custom) && (m_offset > sp.offset))
+            memset(m_ptr + sp.offset, 0, m_offset - sp.offset);
+
+        m_offset = sp.offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+        m_count = sp.count;
+#endif
+#ifdef ENGRAM_EASY_POP
+        m_array_stacksz = sp.array_stacksz;
+#endif
+        return true;
+    }
+
+    /** @return Number of save points currently pending. */
+    std::size_t save_depth() const noexcept { return m_save_stacksz; }
 
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin()
@@ -2004,7 +1916,217 @@ public:
     }
 };
 
-static void handle_heap_fallback(arena& arena, int32_t flags)
+#ifdef ENGRAM_UNIX_ENV
+
+inline std::size_t get_total_stack_space()
+{
+	pthread_attr_t attr;
+    void *stack_base;
+    std::size_t stack_size;
+
+    pthread_getattr_np(pthread_self(), &attr);
+    pthread_attr_getstack(&attr, &stack_base, &stack_size);
+    pthread_attr_destroy(&attr);
+	
+	return stack_size;
+}
+
+inline std::size_t get_page_size()
+{
+    auto pagesz = sysconf(_SC_PAGESIZE);
+    return pagesz == -1 ? ENGRAM_FALLBACK_PAGESZ : pagesz;
+}
+
+inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
+{
+    auto shared = (flags & (engram::flags::shared | engram::flags::unified)) != 0;
+    auto contiguous = (flags & engram::flags::true_contiguous) != 0;
+
+	if (shared || contiguous)
+	{
+        auto fd = 
+#ifdef __linux__
+		    (flags & engram::flags::unified) ? fd : -1;
+#else
+            -1;
+#endif
+#ifdef __APPLE__
+            MAP_ANON | 
+#else
+            MAP_ANONYMOUS | 
+#endif
+#if defined(BSD)
+            (contiguous ? MAP_ALIGNED_SUPER : 0) | 
+#elif __linux__
+            (contiguous ? MAP_HUGETLB : 0) | 
+#else
+            0 |
+#endif
+            (shared ? MAP_SHARED : MAP_PRIVATE);
+		void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, 
+#ifdef __APPLE__
+            contiguous ? VM_FLAGS_SUPERPAGE_SIZE_2MB : -1, 
+#else
+            fd,
+#endif
+            0);
+		if (addr == MAP_FAILED) return { nullptr, false };
+        if ((flags & engram::flags::pin_to_physical) != 0)
+            mlock(addr, size);
+		return { (std::byte*)addr, true };
+	}
+	else
+    {
+        auto isStdLib = false;
+        void* memory = nullptr;
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+        try {
+#endif
+		    memory = ::operator new[](size, std::align_val_t{alignment});
+		    isStdLib = true;
+            if ((flags & engram::flags::pin_to_physical) != 0)
+                mlock(memory, size);
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+        }
+        catch (const std::bad_alloc&) {
+            memory = nullptr;
+        }
+#endif
+		return { (std::byte*)memory, !isStdLib };
+    }
+}
+#elif _WIN32
+
+inline std::size_t get_total_stack_space()
+{
+	ULONG_PTR low_limit, high_limit;
+    GetCurrentThreadStackLimits(&low_limit, &high_limit);
+    auto pagesz = high_limit - low_limit;
+    return pagesz > 0 ? pagesz : ENGRAM_FALLBACK_PAGESZ;
+}
+
+inline std::size_t get_page_size()
+{
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize;
+}
+
+inline void* allocate_contiguous(std::size_t size)
+{
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return nullptr;
+    }
+
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    if (!LookupPrivilegeValue(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
+        CloseHandle(hToken);
+        return nullptr;
+    }
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    // AdjustTokenPrivileges returns TRUE even if some privileges aren't adjusted. 
+    // Always check GetLastError() afterward.
+    if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL) || 
+        GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+        CloseHandle(hToken);
+        return nullptr;
+    }
+
+    CloseHandle(hToken);
+
+    MEM_EXTENDED_PARAMETER extendedParam = {};
+    extendedParam.Type = MemExtendedParameterAttributeFlags;
+    extendedParam.ULong64 = MEM_EXTENDED_PARAMETER_NONPAGED_HUGE;
+    void* pBuffer = VirtualAlloc2(
+        GetCurrentProcess(),                                // Process handle
+        NULL,                                               // Base address (let OS choose)
+        size,                                               // Size of allocation
+        MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES,         // Allocation flags
+        PAGE_READWRITE,                                     // Page protection
+        &extendedParam,                                     // Pointer to extended parameters
+        1                                                   // Parameter count
+    );
+
+    return pBuffer;
+}
+
+inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
+{
+    (void)fd;
+	void* memory = nullptr;
+	auto isStdLib = false;
+	if (flags & engram::flags::true_contiguous) 
+		memory = allocate_contiguous(size);
+	else if (flags & engram::flags::shared)
+		memory = VirtualAlloc2(
+			GetCurrentProcess(),
+			NULL,
+			size,
+			MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+			PAGE_NOACCESS,
+			NULL, 0
+		);
+	else
+	{
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+        try {
+#endif
+		    memory = ::operator new[](size, std::align_val_t{alignment});
+		    isStdLib = true;
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+        }
+        catch (const std::bad_alloc&) {
+            memory = nullptr;
+        }
+#endif
+	}
+
+    if (flags & engram::flags::pin_to_physical)
+        VirtualLock(memory, size);
+	
+	return { (std::byte*)memory, !isStdLib };
+}
+#endif
+
+inline void heap_allocate(arena& arena, int32_t flags, std::size_t alignment, int fd)
+{
+	std::tie(arena.m_ptr, arena.m_use_sys_free) = heap_allocate_impl(arena.m_size, flags, alignment, fd);
+    arena.m_alignment = alignment;
+    if (arena.m_ptr == nullptr)
+        arena.m_error = arena_error::alloc_failed;
+    else
+        arena.m_type = memory_source::heap;
+}
+
+inline void heap_free(arena& arena)
+{
+    if (arena.m_ptr)
+    {
+        if (arena.m_clear_on_free)
+            memset(arena.m_ptr, 0, arena.m_size);
+
+        if (arena.m_use_sys_free)
+#ifdef _WIN32
+            VirtualFree((void*)arena.m_ptr, 0, MEM_RELEASE);
+#elif ENGRAM_UNIX_ENV
+            munmap((void*)arena.m_ptr, arena.m_size);
+#endif
+        else
+            ::operator delete[](arena.m_ptr, std::align_val_t{arena.m_alignment});
+        arena.m_ptr = nullptr;
+    }
+}
+
+inline void handle_heap_fallback(arena& arena, int32_t flags)
 {
     if ((arena.m_ptr == nullptr) && (flags & engram::flags::heap_fallback))
 		heap_allocate(arena, flags);
@@ -2020,9 +2142,9 @@ namespace vendor {
 #if __APPLE__
 
 #ifdef ENGRAM_METAL_CPP
-static inline std::unordered_map<std::byte*, MTL::Buffer*> metal_mem_info_map;
+inline std::unordered_map<std::byte*, MTL::Buffer*> metal_mem_info_map;
 
-void free_metal(arena& arena)
+inline void free_metal(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2038,7 +2160,7 @@ void free_metal(arena& arena)
             heap_free(arena);
 }
 
-void allocate_metal(arena& arena, MTL::Device* device, int32_t flags)
+inline void allocate_metal(arena& arena, MTL::Device* device, int32_t flags)
 {
     auto buffer = device->newBuffer(arena.m_size, MTL::ResourceStorageModeShared);
     if (buffer)
@@ -2060,9 +2182,9 @@ void allocate_metal(arena& arena, MTL::Device* device, int32_t flags)
 
 #else
 
-static inline std::unordered_map<std::byte*, std::pair<id, id>> metal_mem_info_map;
+inline std::unordered_map<std::byte*, std::pair<id, id>> metal_mem_info_map;
 
-void free_metal(arena& arena)
+inline void free_metal(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2079,7 +2201,7 @@ void free_metal(arena& arena)
             heap_free(arena);
 }
 
-void allocate_metal(arena& arena, id device, int32_t flags)
+inline void allocate_metal(arena& arena, id device, int32_t flags)
 {
     Class MTLHeapDescriptorClass = objc_lookUpClass("MTLHeapDescriptor");
     id heapDescriptor = ((id (*)(Class, SEL))objc_msgSend)(MTLHeapDescriptorClass, sel_registerName("alloc"));
@@ -2126,7 +2248,7 @@ void allocate_metal(arena& arena, id device, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_VULKAN
 
-static std::optional<uint32_t> vk_find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties, VkPhysicalDevice physicalDevice) 
+inline std::optional<uint32_t> vk_find_memory_type(uint32_t typeFilter, VkMemoryPropertyFlags properties, VkPhysicalDevice physicalDevice) 
 {
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
@@ -2138,7 +2260,7 @@ static std::optional<uint32_t> vk_find_memory_type(uint32_t typeFilter, VkMemory
     return std::nullopt;
 }
 
-void free_vulkan(arena& arena)
+inline void free_vulkan(arena& arena)
 {
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2158,7 +2280,7 @@ void free_vulkan(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_vulkan(arena& arena, VkDevice& device, VkPhysicalDevice& physicalDevice, const VkAllocationCallbacks* allocCbs = nullptr, 
+inline void allocate_vulkan(arena& arena, VkDevice& device, VkPhysicalDevice& physicalDevice, const VkAllocationCallbacks* allocCbs = nullptr, 
     VkDeviceSize offset = 0, VkMemoryMapFlags vkflags = 0, int32_t flags = 0)
 {
 	VkBuffer buffer;
@@ -2210,7 +2332,7 @@ void allocate_vulkan(arena& arena, VkDevice& device, VkPhysicalDevice& physicalD
 
 #ifdef ENGRAM_ENABLE_DX12
 
-void free_dx12(arena& arena)
+inline void free_dx12(arena& arena)
 {
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2227,7 +2349,7 @@ void free_dx12(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLAGS descflags, 
+inline void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLAGS descflags, 
     D3D12_RESOURCE_STATES resflags, int32_t flags)
 {
 	D3D12_HEAP_PROPERTIES heapProps = {};
@@ -2261,7 +2383,7 @@ void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLA
 		if (computeBuffer->Map(0, &readRange, &pPersistentlyMappedData) == S_OK)
 		{
 			arena.m_ptr = (std::byte*)pPersistentlyMappedData;
-			dx12_mem_info_map.emplace(arena.m_ptr, device);
+			dx12_mem_info_map.emplace(arena.m_ptr, computeBuffer);
 
             if (flags & engram::flags::commit)
                 std::memset(arena.m_ptr, 0, arena.m_size);
@@ -2279,7 +2401,7 @@ void allocate_dx12(arena& arena, ComPtr<ID3D12Device> device, D3D12_RESOURCE_FLA
 
 #ifdef ENGRAM_ENABLE_CUDA
 
-void free_cuda(arena& arena) 
+inline void free_cuda(arena& arena) 
 { 
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2288,7 +2410,7 @@ void free_cuda(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_cuda(arena& arena, int32_t flags)
+inline void allocate_cuda(arena& arena, int32_t flags)
 {
 	auto err = (flags & engram::flags::unified)
 		? cudaMallocManaged((void**)&arena.m_ptr, arena.m_size)
@@ -2313,7 +2435,7 @@ void allocate_cuda(arena& arena, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_ROCM
 
-void free_rocm(arena& arena) 
+inline void free_rocm(arena& arena) 
 { 
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2322,7 +2444,7 @@ void free_rocm(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_rocm(arena& arena, int32_t flags)
+inline void allocate_rocm(arena& arena, int32_t flags)
 {
 	auto err = (flags & engram::flags::unified)
 		? hipMallocManaged((void**)&arena.m_ptr, arena.m_size)
@@ -2347,7 +2469,7 @@ void allocate_rocm(arena& arena, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_OPENCL
 
-void free_opencl(arena& arena)
+inline void free_opencl(arena& arena)
 {
     if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2363,7 +2485,7 @@ void free_opencl(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_opencl(arena& arena, cl_context context, cl_svm_mem_flags clflags, cl_uint alignment, int32_t flags)
+inline void allocate_opencl(arena& arena, cl_context context, cl_svm_mem_flags clflags, cl_uint alignment, int32_t flags)
 {
     arena.m_ptr = (std::byte*)clSVMAlloc(context, clflags, arena.m_size, alignment);
     if (arena.m_ptr)
@@ -2379,7 +2501,7 @@ void allocate_opencl(arena& arena, cl_context context, cl_svm_mem_flags clflags,
 
 #ifdef ENGRAM_ENABLE_XDNA
 	
-void free_xdna(arena& arena) 
+inline void free_xdna(arena& arena) 
 { 
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2392,7 +2514,7 @@ void free_xdna(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_xdna(xrtDeviceHandle device, xrtBufferFlags xoflags, xrtMemoryGroup group, arena& arena, int32_t flags)
+inline void allocate_xdna(xrtDeviceHandle device, xrtBufferFlags xoflags, xrtMemoryGroup group, arena& arena, int32_t flags)
 {
 	assert(device != NULL);
 	auto handle = xrtBOAlloc(device, arena.m_size, xoflags, group);
@@ -2419,7 +2541,7 @@ void allocate_xdna(xrtDeviceHandle device, xrtBufferFlags xoflags, xrtMemoryGrou
     handle_heap_fallback(arena, flags);
 }
 
-xrtBufferHandle get_xrt_buffer_handle(arena& arena)
+inline xrtBufferHandle get_xrt_buffer_handle(arena& arena)
 {
     if (arena.m_type == memory_source::custom)
     {
@@ -2435,7 +2557,7 @@ xrtBufferHandle get_xrt_buffer_handle(arena& arena)
 
 #ifdef ENGRAM_ENABLE_DPDK
 
-void free_dpdk(arena& arena)
+inline void free_dpdk(arena& arena)
 {
 	if (arena.m_ptr)
 		if (arena.m_type == memory_source::custom)
@@ -2453,7 +2575,7 @@ void free_dpdk(arena& arena)
 			heap_free(arena);
 }
 
-void allocate_dpdk(std::string_view name, int align, int socketId, unsigned int dpdkFlags, bool useVirtAddr, arena& arena, int32_t flags)
+inline void allocate_dpdk(std::string_view name, int align, int socketId, unsigned int dpdkFlags, bool useVirtAddr, arena& arena, int32_t flags)
 {
 	if (flags & engram::flags::true_contiguous)
 	{
@@ -2480,7 +2602,7 @@ void allocate_dpdk(std::string_view name, int align, int socketId, unsigned int 
 
 #ifdef ENGRAM_ENABLE_OP_TEE
 
-void free_op_tee(arena& arena)
+inline void free_op_tee(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2489,7 +2611,7 @@ void free_op_tee(arena& arena)
             heap_free(arena);
 }
 
-void allocate_op_tee(arena& arena, uint32_t hint, int32_t flags)
+inline void allocate_op_tee(arena& arena, uint32_t hint, int32_t flags)
 {
     auto ptr = TEE_Malloc(arena.m_size, hint);
     if (ptr)
@@ -2507,7 +2629,7 @@ void allocate_op_tee(arena& arena, uint32_t hint, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_SYCL
 
-void free_sycl(arena& arena)
+inline void free_sycl(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2523,7 +2645,7 @@ void free_sycl(arena& arena)
             heap_free(arena);
 }
 
-void allocate_sycl(arena& arena, sycl::queue& queue, int32_t flags)
+inline void allocate_sycl(arena& arena, sycl::queue& queue, int32_t flags)
 {
     arena.m_ptr = (std::byte*)sycl::malloc_shared(arena.m_size, queue);
     if (arena.m_ptr)
@@ -2544,7 +2666,7 @@ void allocate_sycl(arena& arena, sycl::queue& queue, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_LEVEL_ZERO
 
-void free_level_zero(arena& arena)
+inline void free_level_zero(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2560,7 +2682,7 @@ void free_level_zero(arena& arena)
             heap_free(arena);
 }
 
-void allocate_level_zero(arena& arena, ze_context_handle_t context, ze_device_handle_t device, int32_t flags)
+inline void allocate_level_zero(arena& arena, ze_context_handle_t context, ze_device_handle_t device, int32_t flags)
 {
     ze_device_mem_alloc_desc_t deviceDesc = {};
     deviceDesc.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
@@ -2588,7 +2710,7 @@ void allocate_level_zero(arena& arena, ze_context_handle_t context, ze_device_ha
 
 #ifdef ENGRAM_ENABLE_WEBGPU
 
-void free_webgpu(arena& arena)
+inline void free_webgpu(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2605,7 +2727,7 @@ void free_webgpu(arena& arena)
             heap_free(arena);
 }
 
-void allocate_webgpu(arena& arena, WGPUDevice device, int32_t flags)
+inline void allocate_webgpu(arena& arena, WGPUDevice device, int32_t flags)
 {
     WGPUBufferDescriptor desc = {};
     desc.size = arena.m_size;
@@ -2637,7 +2759,7 @@ void allocate_webgpu(arena& arena, WGPUDevice device, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_PMDK
 
-void free_pmdk(arena& arena)
+inline void free_pmdk(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2653,7 +2775,7 @@ void free_pmdk(arena& arena)
             heap_free(arena);
 }
 
-void allocate_pmdk(arena& arena, const char* path, int pmdk_flags, mode_t mode, int32_t flags)
+inline void allocate_pmdk(arena& arena, const char* path, int pmdk_flags, mode_t mode, int32_t flags)
 {
     std::size_t mapped_len = 0;
     int is_pmem = 0;
@@ -2682,7 +2804,7 @@ void allocate_pmdk(arena& arena, const char* path, int pmdk_flags, mode_t mode, 
 
 #ifdef ENGRAM_ENABLE_RDMA
 
-void free_rdma(arena& arena)
+inline void free_rdma(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2698,7 +2820,7 @@ void free_rdma(arena& arena)
             heap_free(arena);
 }
 
-void allocate_rdma(arena& arena, void* buffer, ibv_pd* pd, int access, int32_t flags)
+inline void allocate_rdma(arena& arena, void* buffer, ibv_pd* pd, int access, int32_t flags)
 {
     if (buffer)
     {
@@ -2718,7 +2840,7 @@ void allocate_rdma(arena& arena, void* buffer, ibv_pd* pd, int access, int32_t f
     handle_heap_fallback(arena, flags);
 }
 
-ibv_mr* get_rdma_mr(arena& arena)
+inline ibv_mr* get_rdma_mr(arena& arena)
 {
     if (arena.m_type == memory_source::custom)
     {
@@ -2734,7 +2856,7 @@ ibv_mr* get_rdma_mr(arena& arena)
 
 #ifdef ENGRAM_ENABLE_GPUDIRECT
 
-void free_gpudirect(arena& arena)
+inline void free_gpudirect(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2746,7 +2868,7 @@ void free_gpudirect(arena& arena)
             heap_free(arena);
 }
 
-void allocate_gpudirect(arena& arena, int32_t flags)
+inline void allocate_gpudirect(arena& arena, int32_t flags)
 {
     if (cudaMalloc((void**)&arena.m_ptr, arena.m_size) == cudaSuccess)
     {
@@ -2775,7 +2897,7 @@ void allocate_gpudirect(arena& arena, int32_t flags)
 
 #ifdef ENGRAM_ENABLE_DMABUF
 
-void free_dmabuf(arena& arena)
+inline void free_dmabuf(arena& arena)
 {
     if (arena.m_ptr)
         if (arena.m_type == memory_source::custom)
@@ -2792,7 +2914,7 @@ void free_dmabuf(arena& arena)
             heap_free(arena);
 }
 
-void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
+inline void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
 {
     // A negative device fd means "use the default system dma-buf heap".
     bool ownsHeap = deviceFd < 0;
@@ -2839,3 +2961,5 @@ void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
 } // namespace vendor
 
 } // namespace engram
+
+#endif // ENGRAM_H_INCLUDED

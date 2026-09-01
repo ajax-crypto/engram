@@ -215,7 +215,7 @@ a.pop_array<256, float>();          // compile-time count
 ```
 
 Define `ENGRAM_EASY_POP` and the arena remembers each array/string size (up to
-`ENGRAM_MAX_STRING_STACKSZ`, default 64), so you can pop without repeating it:
+`ENGRAM_MAX_ARRAY_STACKSZ`, default 64), so you can pop without repeating it:
 
 ```cpp
 a.pop_array<float>();               // size recalled automatically
@@ -242,6 +242,53 @@ fields backing them) entirely; both accessors then always return `0`.
 
 `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
+
+### Save & Restore (scoped rewind)
+
+`save()` records the current head; `restore()` rewinds to the most recent save
+point, zeroing everything pushed since and putting the allocation bookkeeping
+back where it was. It is the implicit counterpart to `partition` — a scratch
+scope with no explicit region, no size to pick up front, and no second arena
+object:
+
+```cpp
+auto a = arena::heap(1 << 20);
+auto& cfg = a.push<config>();        // long-lived
+
+a.save();                            // mark the head
+{
+    auto scratch = a.push_array<float>(4096);
+    auto name    = a.push_string("temp");
+    // ... use the scratch data ...
+}
+a.restore();                         // scratch + name are gone and zeroed; cfg survives
+```
+
+Save points nest LIFO and live in a fixed array, so neither call allocates:
+
+```cpp
+a.save();                 // outer scope
+   a.save();              // inner scope
+   a.restore();           // back to the outer mark
+a.restore();              // back to the original head
+```
+
+| Call            | Effect                                                            |
+| --------------- | ----------------------------------------------------------------- |
+| `save()`        | Push the current head; `false` if the save stack is full.          |
+| `restore()`     | Rewind to the newest save point; `false` if none is pending.       |
+| `save_depth()`  | Number of pending save points.                                     |
+| `reset()`       | Rewinds to empty and drops all pending save points.                |
+
+The stack depth defaults to 32 entries; define `ENGRAM_MAX_SAVE_STACKSZ` before
+including the header to change it (and compile `engram.cpp` with the same value
+in the split build).
+
+> `restore()` runs **no destructors** — it is a raw rewind, like `reset()`. Pop
+> anything that needs cleanup before restoring. The reclaimed bytes are zeroed
+> unless the arena was created with `flags::no_clear`; device
+> (`memory_source::custom`) arenas are never host-cleared, since their storage
+> may not be addressable from the CPU.
 
 ### Partitioning (sub-arenas)
 
@@ -662,6 +709,11 @@ mv[:5] = b"hello"
 a.push_bytes(b"world")                          # copy a bytes-like object in
 s = a.push_str("greetings")                     # NUL-terminated string
 
+a.save()                                        # mark the head
+scratch = a.alloc(4096)                         # temporary working set
+del scratch                                     # drop views before rewinding
+a.restore()                                     # scratch is reclaimed and zeroed
+
 print(a.used, a.capacity, a.remaining, a.source)
 
 # adopt a buffer you already own (the arena will not free it)
@@ -675,7 +727,7 @@ engram.prefetch(buf)
 
 What's exposed: the `Arena` factories (`create`, `stack`, `heap`, `adopt`),
 byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`, `partition`),
-introspection
+scoped rewind (`save`, `restore`, `save_depth`), introspection
 (`used`, `capacity`, `remaining`, `count`, `total`, `source`, `data`, `is_valid`,
 `empty`), `prefetch` / `warm_cache` / `sync` / `reset` / `unpin`, the `MemorySource`,
 `CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
