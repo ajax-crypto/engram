@@ -73,6 +73,7 @@ engram is distributed in two forms that share the same `engram::arena` API:
 | Encapsulation       | Internals visible in the header                                  | Internals hidden behind the opaque pointer; changing them doesn't force a rebuild    |
 | Runtime cost        | State stored inline in `arena` — no indirection, no extra alloc  | One heap allocation for `impl_data` per arena + a pointer hop to reach state         |
 | Creation API        | Typed `arena::create_vulkan/_dx12/…` factories **and** `create_custom` | Single `arena::create_custom(size, custom, flags, …)` enum dispatch            |
+| Freestanding        | Supported via `ENGRAM_ENABLE_FREESTANDING` (see [Freestanding Builds](#freestanding-builds)) | **Not possible** — the PIMPL `impl_data` is heap-allocated per arena; the header `#error`s out |
 
 **Use the single header** for quick integration, small projects, or when you want
 zero build configuration and don't mind the extra per-TU compile cost.
@@ -95,6 +96,9 @@ Targets are described by `memory_source`:
 | `memory_source::heap`      | aligned `new`, or OS primitives for contiguous/shared pages |
 | `memory_source::external`  | A user-supplied buffer the arena does not own          |
 | `memory_source::custom`    | Any user allocator, including the device backends below |
+
+On a target with no OS or heap, `ENGRAM_ENABLE_FREESTANDING` narrows this to
+`stack` and `external` — see [Freestanding Builds](#freestanding-builds).
 
 Optional accelerator/device backends are compiled in via preprocessor switches
 (see [Optional Backends](#optional-backends)):
@@ -417,6 +421,10 @@ start = 0, size = 0)` warms the arena's own bytes, and — as shown in the table
 above — the variadic `a.prefetch(start, size)` on a plain **heap** arena forwards
 to `engram::prefetch` (`madvise` / `PrefetchVirtualMemory`).
 
+`arena::warm_cache` works on any host-backed arena (stack, adopted, or heap);
+device (`memory_source::custom`) arenas are skipped, since their storage may not
+be addressable from the CPU.
+
 ### Error Handling
 
 Failures are reported through the `m_error` field using `arena_error`
@@ -630,6 +638,81 @@ path by defining the matching macro before including `engram.h`:
 (DirectX 12 uses fixed system headers and is not overridable. GPUDirect also
 includes `<cuda_runtime.h>` unconditionally.)
 
+## Freestanding Builds
+
+Define `ENGRAM_ENABLE_FREESTANDING` to build the **single header** against a
+target with no operating system, no heap, and no vendor SDKs — a bootloader, a
+kernel, an RTOS task, or bare metal:
+
+```cpp
+#define ENGRAM_ENABLE_FREESTANDING
+#include "engram.h"
+
+alignas(std::max_align_t) static std::byte pool[64 * 1024];
+
+auto a = engram::arena::adopt(pool, sizeof(pool), engram::flags::commit);
+auto scratch = engram::arena::stack(1024, /*fallbackToHeap=*/false);
+```
+
+You usually don't have to define it yourself: the header turns the mode on
+automatically when the compiler reports a freestanding implementation via
+`__STDC_HOSTED__ == 0` (`-ffreestanding` on GCC/Clang, and most bare-metal
+toolchains by default). Defining `ENGRAM_ENABLE_FREESTANDING` explicitly is for
+the cases the compiler doesn't advertise.
+
+The macro force-`#undef`s every `ENGRAM_ENABLE_*` backend switch (plus
+`ENGRAM_ALL` and the Metal macros), so it always wins over anything your build
+system passes in. It also implies `ENGRAM_DISABLE_PMR`, since
+`std::pmr::monotonic_buffer_resource` is a hosted facility. No OS header
+(`<sys/mman.h>`, `<pthread.h>`, `<windows.h>`, …) is included.
+
+**What you keep:** stack and adopted arenas, and every arena feature built on
+them — `push` / `push_array` / `push_string`, the matching `pop`s (including
+`ENGRAM_EASY_POP`), `save` / `restore`, `reset`, `partition`, `data`, and all the
+introspection accessors.
+
+**What is compiled out:**
+
+| Removed                                            | Why                                  |
+| -------------------------------------------------- | ------------------------------------ |
+| `arena::heap`, `arena::heapfile`, `memory_source::heap` | No heap.                        |
+| `flags::heap_fallback`, `page_aligned`, `true_contiguous`, `shared`, `pin_to_physical`, and `arena::unpin()` | Heap / OS paging only. |
+| `arena::create_custom` and every `arena::create_<vendor>` factory | No vendor runtimes.    |
+| `arena::sync(...)` / `arena::prefetch(...)`, and the free `engram::prefetch` | Device runtimes and OS paging. |
+| `arena::get_pmr_resource(...)`                     | Implied `ENGRAM_DISABLE_PMR`.        |
+
+Because there is nothing to query for the thread's stack bounds, stack arenas are
+checked against `ENGRAM_FREESTANDING_STACKSZ` (default 64 KiB); define it to match
+your target's stack budget. Oversized requests report
+`arena_error::stack_overflow` rather than falling back anywhere.
+
+### `ENGRAM_ENABLE_FSEXTRA`
+
+Cache warming lowers to a plain CPU instruction and needs no OS, but it is off by
+default in freestanding builds so the generated code stays minimal. Define
+`ENGRAM_ENABLE_FSEXTRA` alongside `ENGRAM_ENABLE_FREESTANDING` to bring back the
+free `engram::warm_cache` and both `arena::warm_cache` overloads:
+
+```cpp
+#define ENGRAM_ENABLE_FREESTANDING
+#define ENGRAM_ENABLE_FSEXTRA
+#include "engram.h"
+```
+
+`engram::prefetch` stays out even with `ENGRAM_ENABLE_FSEXTRA` — it is a request
+to the OS pager (`madvise` / `PrefetchVirtualMemory`), and there is no pager.
+
+> Neither macro changes anything in a normal build: all of the above is enabled
+> by default, and `ENGRAM_ENABLE_FSEXTRA` has no effect without
+> `ENGRAM_ENABLE_FREESTANDING`.
+
+> Freestanding applies to the **single header only**. The header + source pair
+> stores its state behind an opaque `impl_data*` that the constructor allocates
+> with `new`, so a working heap is a hard requirement there. `src/engram.h`
+> enforces this: it raises a `#error` if `ENGRAM_ENABLE_FREESTANDING` is defined
+> or the compiler reports `__STDC_HOSTED__ == 0`, so the mismatch surfaces up
+> front instead of as a link failure.
+
 ## Building
 
 Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-header--source)):
@@ -638,6 +721,9 @@ Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-heade
   `#include` it. No build step.
 - **Header + source** — add `src/` to your includes and compile `src/engram.cpp`
   into your target (or link the library the bundled `CMakeLists.txt` builds).
+
+For a target with no OS, heap, or vendor runtime, use the single header with
+`ENGRAM_ENABLE_FREESTANDING` — see [Freestanding Builds](#freestanding-builds).
 
 The provided `CMakeLists.txt` exposes `ENGRAM_SINGLE_HEADER` (default `ON`) to
 switch between the two, plus an `ENGRAM_ENABLE_*` option per backend. Either way,

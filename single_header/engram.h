@@ -12,11 +12,49 @@
 #define _GNU_SOURCE
 #endif
 
+// A conforming freestanding implementation reports __STDC_HOSTED__ as 0.
+#if defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0) && !defined(ENGRAM_ENABLE_FREESTANDING)
+#define ENGRAM_ENABLE_FREESTANDING
+#endif
+
+#ifdef ENGRAM_ENABLE_FREESTANDING
+// No OS, no heap, no vendor SDKs: only stack and adopted arenas remain.
+#undef ENGRAM_ALL
+#undef ENGRAM_ENABLE_VULKAN
+#undef ENGRAM_ENABLE_DX12
+#undef ENGRAM_ENABLE_CUDA
+#undef ENGRAM_ENABLE_ROCM
+#undef ENGRAM_ENABLE_OPENCL
+#undef ENGRAM_ENABLE_SYCL
+#undef ENGRAM_ENABLE_LEVEL_ZERO
+#undef ENGRAM_ENABLE_WEBGPU
+#undef ENGRAM_ENABLE_XDNA
+#undef ENGRAM_ENABLE_DPDK
+#undef ENGRAM_ENABLE_OP_TEE
+#undef ENGRAM_ENABLE_PMDK
+#undef ENGRAM_ENABLE_RDMA
+#undef ENGRAM_ENABLE_GPUDIRECT
+#undef ENGRAM_ENABLE_DMABUF
+#undef ENGRAM_METAL_CPP
+#undef ENGRAM_METAL_PRIVATE_IMPL
+
+// monotonic_buffer_resource is a hosted facility, so PMR goes with the heap.
+#ifndef ENGRAM_DISABLE_PMR
+#define ENGRAM_DISABLE_PMR
+#endif
+
+/** @brief Stack budget a freestanding stack arena is checked against (nothing to query). */
+#ifndef ENGRAM_FREESTANDING_STACKSZ
+#define ENGRAM_FREESTANDING_STACKSZ (64 * 1024)
+#endif
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
 #include <type_traits>
 #include <span>
+#include <string_view>
 #include <new>
 #include <cstdarg>
 #include <stdlib.h>
@@ -45,11 +83,16 @@
 #define ENGRAM_MAX_SAVE_STACKSZ 32
 #endif
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
 #ifdef _WIN32
 #define ENGRAM_ENABLE_DX12
 #elif defined(__unix__) || defined(__UNIX__) || (defined(__APPLE__) && defined(__MACH__))
 #include <sys/param.h>
 #define ENGRAM_UNIX_ENV 1
+#endif
+#ifdef __APPLE__
+#define ENGRAM_ENABLE_METAL 1
+#endif
 #endif
 
 #ifdef ENGRAM_ALL
@@ -271,6 +314,7 @@ inline void prefetch_hint(const void* addr, int rw, int locality)
 #define PrefetchIntoCache(addr, rw, locality) ((void)(addr), (void)(rw), (void)(locality))
 #endif
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
 #ifdef ENGRAM_UNIX_ENV
 #include <sys/mman.h>
 #include <pthread.h>
@@ -281,8 +325,9 @@ inline void prefetch_hint(const void* addr, int rw, int locality)
 #include <windows.h>
 #include <processthreadsapi.h>
 #endif
+#endif
 
-#if __APPLE__
+#ifdef ENGRAM_ENABLE_METAL
 #ifdef ENGRAM_METAL_CPP
 #ifdef ENGRAM_METAL_PRIVATE_IMPL
 #define NS_PRIVATE_IMPLEMENTATION
@@ -366,7 +411,7 @@ using Microsoft::WRL::ComPtr;
 
 namespace vendor {
 
-#if __APPLE__
+#ifdef ENGRAM_ENABLE_METAL
 
 inline void free_metal(arena& arena);
 
@@ -491,10 +536,13 @@ inline void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags);
 // Platform primitives and the heap backend. `heap_allocate` / `heap_free` need a complete
 // `arena`, so the whole block is defined after the class and only declared here.
 inline std::size_t get_total_stack_space();
+#ifndef ENGRAM_ENABLE_FREESTANDING
 inline std::size_t get_page_size();
 inline void heap_allocate(arena& arena, int32_t flags, std::size_t alignment = alignof(std::max_align_t), int fd = -1);
 inline void heap_free(arena& arena);
+#endif
 
+#if !defined(ENGRAM_ENABLE_FREESTANDING) || defined(ENGRAM_ENABLE_FSEXTRA)
 /**
  * @brief Emit CPU prefetch hints for `sizeof(T)`-aligned data at @p ptr.
  * @tparam T       Pointee type.
@@ -507,7 +555,9 @@ void warm_cache(T* ptr, cache_locality locality, int32_t ioflags)
 {
     PrefetchIntoCache(ptr, (ioflags & flags::write) ? 1 : 0, static_cast<int>(locality));
 }
+#endif
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
 /**
  * @brief Page a host range into RAM (`madvise(MADV_WILLNEED)` / `PrefetchVirtualMemory`).
  * @tparam T   Pointee type.
@@ -545,6 +595,7 @@ bool prefetch(T* ptr, std::size_t size)
 
     return ok;
 }
+#endif
 
 /**
  * @brief Move-only bump-pointer allocator that owns one block of memory.
@@ -719,6 +770,7 @@ public:
         result.m_size = size;
         result.m_clear_on_free = !(flags & engram::flags::no_clear);
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
         if ((flags & engram::flags::page_aligned) && (type != memory_source::custom))
         {
             auto pagesz = get_page_size();
@@ -726,21 +778,33 @@ public:
                 alignment = pagesz;
             size = ((size / pagesz) + 1) * pagesz;
         }
+#else
+        (void)alignment;
+        (void)fd;
+#endif
 		
 		switch (type) 
         {
 			case memory_source::stack: 
 			{
                 auto stacksz =  get_total_stack_space();
+#ifndef ENGRAM_ENABLE_FREESTANDING
                 if (!(flags & engram::flags::heap_fallback) && (size >= stacksz)) 
                     result.m_error = arena_error::stack_overflow;
                 else if ((flags & engram::flags::heap_fallback) && (size > stacksz))
                     heap_allocate(result, flags, alignment, fd);
 				else 
                     result.m_ptr = (std::byte*)StackAllocate(size); 
+#else
+                if (size >= stacksz)
+                    result.m_error = arena_error::stack_overflow;
+                else
+                    result.m_ptr = (std::byte*)StackAllocate(size);
+#endif
 				break;
             }
 				
+#ifndef ENGRAM_ENABLE_FREESTANDING
 			case memory_source::heap:
 			{
 				heap_allocate(result, flags, alignment, fd);
@@ -753,6 +817,7 @@ public:
 				else result.m_error = arena_error::alloc_failed;
 				break;
 			}
+#endif
 
             default: assert(false); break;
 		}
@@ -770,6 +835,7 @@ public:
         return create(memory_source::stack, size, fallbackToHeap ? engram::flags::heap_fallback : 0);
     }
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
     /**
      * @brief Create a heap arena (page-aligned; optionally physically contiguous).
      * @param size           Capacity in bytes.
@@ -816,6 +882,7 @@ public:
 
         return arena{};
     }
+#endif
 #endif
 
     /**
@@ -866,6 +933,7 @@ public:
         return adopt(storage, size, flags);
     }
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
     /**
      * @brief Create a custom arena by invoking @p func to populate it.
      * @param size   Capacity in bytes.
@@ -918,7 +986,7 @@ public:
 
         switch (type)
         {
-#if __APPLE__
+#ifdef ENGRAM_ENABLE_METAL
             case custom::Metal:
             {
 #ifdef ENGRAM_METAL_CPP
@@ -1066,8 +1134,9 @@ public:
         va_end(args);
         return result;
     }
+#endif
 
-#if __APPLE__
+#ifdef ENGRAM_ENABLE_METAL
     /** @brief Create an arena over a shared Metal buffer (Apple). @param device `MTL::Device*`. */
     [[nodiscard]] static arena create_metal(std::size_t size, MTL::Device* device, int32_t flags = 0)
     {
@@ -1275,7 +1344,9 @@ public:
 		switch (m_type)
 		{
 			case memory_source::stack: if (m_ptr) { memset(m_ptr, 0, m_size); } break;
+#ifndef ENGRAM_ENABLE_FREESTANDING
 			case memory_source::heap: heap_free(*this); break;
+#endif
 			case memory_source::external: break;
 			case memory_source::custom: if (m_extra) ((void(*)(arena&))m_extra)(*this); break;
 		}
@@ -1605,6 +1676,7 @@ public:
     /** @return Number of save points currently pending. */
     std::size_t save_depth() const noexcept { return m_save_stacksz; }
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin()
     {
@@ -1838,7 +1910,9 @@ public:
         (void)args;
         return ok;
     }
+#endif
 
+#if !defined(ENGRAM_ENABLE_FREESTANDING) || defined(ENGRAM_ENABLE_FSEXTRA)
     /**
      * @brief Emit CPU prefetch hints over a range of the arena's storage.
      * @param locality Target cache level.
@@ -1848,7 +1922,7 @@ public:
      */
     void warm_cache(cache_locality locality, int32_t ioflags, std::size_t start = 0, std::size_t size = 0)
     {
-        if (m_ptr && (m_type == memory_source::heap))
+        if (m_ptr && (m_type != memory_source::custom))
         {
             size = (size == 0) ? m_size - start : size;
             assert(start + size <= m_size);
@@ -1863,12 +1937,13 @@ public:
     template <typename T>
     void warm_cache(T* ptr, cache_locality locality, int32_t ioflags)
     {
-        if (m_ptr && (m_type == memory_source::heap))
+        if (m_ptr && (m_type != memory_source::custom))
         {
             assert((std::byte*)ptr >= m_ptr && (std::byte*)ptr < m_ptr + m_size);
             PrefetchIntoCache(ptr, (ioflags & flags::write) ? 1 : 0, static_cast<int>(locality));
         }
     }
+#endif
 
     bool is_valid() const noexcept { return m_ptr != nullptr; }   ///< @return `true` if the arena holds valid storage.
     bool empty() const noexcept { return m_offset == 0; }         ///< @return `true` if nothing has been pushed yet.
@@ -1916,7 +1991,15 @@ public:
     }
 };
 
-#ifdef ENGRAM_UNIX_ENV
+#ifdef ENGRAM_ENABLE_FREESTANDING
+
+// Nothing to query without an OS, so stack arenas are sized against a compile-time budget.
+inline std::size_t get_total_stack_space()
+{
+    return ENGRAM_FREESTANDING_STACKSZ;
+}
+
+#elif defined(ENGRAM_UNIX_ENV)
 
 inline std::size_t get_total_stack_space()
 {
@@ -2097,6 +2180,7 @@ inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
 }
 #endif
 
+#ifndef ENGRAM_ENABLE_FREESTANDING
 inline void heap_allocate(arena& arena, int32_t flags, std::size_t alignment, int fd)
 {
 	std::tie(arena.m_ptr, arena.m_use_sys_free) = heap_allocate_impl(arena.m_size, flags, alignment, fd);
@@ -2136,10 +2220,11 @@ inline void handle_heap_fallback(arena& arena, int32_t flags)
         arena.m_error = arena_error::alloc_failed;
     }
 }
+#endif
 
 namespace vendor {
 
-#if __APPLE__
+#ifdef ENGRAM_ENABLE_METAL
 
 #ifdef ENGRAM_METAL_CPP
 inline std::unordered_map<std::byte*, MTL::Buffer*> metal_mem_info_map;

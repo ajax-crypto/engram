@@ -1383,7 +1383,7 @@ bool arena::prefetch_va(std::size_t provided, ...)
 void arena::warm_cache(cache_locality locality, int32_t ioflags, std::size_t start, std::size_t size)
 {
     auto& d = *m_impl;
-    if (d.m_ptr && (d.m_type == memory_source::heap))
+    if (d.m_ptr && (d.m_type != memory_source::custom))
     {
         size = (size == 0) ? d.m_size - start : size;
         assert(start + size <= d.m_size);

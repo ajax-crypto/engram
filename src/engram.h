@@ -6,6 +6,12 @@
  *        and GPU / accelerator device memory (PIMPL header + source build).
  */
 
+// This build keeps arena state in a heap-allocated impl_data, so it cannot run
+// without a heap. Freestanding targets need single_header/engram.h instead.
+#if defined(ENGRAM_ENABLE_FREESTANDING) || (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
+#error "engram: the header + source build requires a hosted implementation - arena state is heap-allocated through the PIMPL pointer. Use single_header/engram.h, which supports ENGRAM_ENABLE_FREESTANDING."
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
