@@ -92,7 +92,7 @@ Targets are described by `memory_source`:
 
 | Source                     | Backing                                                |
 | -------------------------- | ------------------------------------------------------ |
-| `memory_source::stack`     | `alloca` / `_alloca`, with optional heap fallback      |
+| `memory_source::stack`     | `alloca` / `_alloca` via `ENGRAM_STACK_ARENA`          |
 | `memory_source::heap`      | aligned `new`, or OS primitives for contiguous/shared pages |
 | `memory_source::external`  | A user-supplied buffer the arena does not own          |
 | `memory_source::custom`    | Any user allocator, including the device backends below |
@@ -112,12 +112,11 @@ in the nested `engram::vendor` namespace.
 The `arena` class exposes static factory functions:
 
 ```cpp
-// Generic factory.
+// Generic factory. Builds heap arenas; stack arenas come from ENGRAM_STACK_ARENA.
 arena arena::create(memory_source type, std::size_t size, int32_t flags = 0,
                     std::size_t alignment = alignof(std::max_align_t));
 
-// Convenience factories.
-arena arena::stack(std::size_t size, bool fallbackToHeap);
+// Convenience factory.
 arena arena::heap(std::size_t size, bool trueContiguous,
                   std::size_t alignment = alignof(std::max_align_t), int fd = -1);
 
@@ -159,6 +158,41 @@ The optional `fd` argument on `heap` (Linux) supplies a file descriptor — e.g.
 `fd` implies `flags::unified`. With `flags::unified` and no `fd`, the heap backend
 creates its own `memfd` so the buffer is shareable / exportable.
 
+### Stack arenas
+
+Stack storage cannot come from a factory function. `alloca` reserves space in the
+frame of whoever calls it, so a `static arena stack(...)` helper would hand back a
+pointer into its own frame the moment it returned. Stack arenas are therefore
+declared with a macro that expands in **your** scope:
+
+```cpp
+void render()
+{
+    ENGRAM_STACK_ARENA(scratch, 8 * 1024);                        // 8 KiB of frame
+    auto xs = scratch.push_array<float>(256);
+    // ... scratch is gone when render() returns ...
+}
+
+ENGRAM_STACK_ARENA(zeroed, 4096, engram::flags::commit);          // optional flags
+```
+
+The request is checked against the thread's stack size before anything is
+reserved. If it does not fit you get an invalid arena reporting
+`arena_error::stack_overflow`, not a smashed stack:
+
+```cpp
+ENGRAM_STACK_ARENA(huge, 1ull << 40);
+assert(!huge.is_valid() && huge.error() == arena_error::stack_overflow);
+```
+
+Two helper names (`<varname>_engram_size_` and `<varname>_engram_storage_`) are
+declared next to the arena, so the macro needs a block scope — give a bare `if`
+branch braces before using it. There is no heap fallback: use `arena::heap` if the
+size is not known to be small.
+
+> The arena and its storage die with the enclosing scope. Do not return it, move
+> it out, or store a `partition` of it beyond that scope.
+
 ### Flags
 
 Behavior is tuned with the `int32_t` constants in the `engram::flags` namespace
@@ -167,7 +201,7 @@ Behavior is tuned with the `int32_t` constants in the `engram::flags` namespace
 | Flag                     | Effect                                              |
 | ------------------------ | --------------------------------------------------- |
 | `flags::none`            | No special behavior.                                |
-| `flags::heap_fallback`   | Fall back to a heap allocation if the target fails. |
+| `flags::heap_fallback`   | Fall back to a heap allocation if the backend allocation fails. |
 | `flags::true_contiguous` | Request physically contiguous / huge-page memory.   |
 | `flags::page_aligned`    | Round the size up to a page boundary.               |
 | `flags::commit`          | Zero-initialize (commit) the memory on allocation.  |
@@ -188,7 +222,7 @@ pushes — popping out of order corrupts the arena offset and is undefined
 behavior.
 
 ```cpp
-auto a = arena::stack(1 << 12, /*fallbackToHeap=*/true);
+ENGRAM_STACK_ARENA(a, 1 << 12);
 
 // Push in order: (1) then (2).
 int&             i  = a.push<int>(42);           // (1) construct a single int
@@ -236,6 +270,7 @@ a.remaining();  // bytes still free
 a.count();      // live allocation count
 a.total();      // lifetime allocation count
 a.source();     // the memory_source backing this arena
+a.error();      // the arena_error recorded during creation
 a.data();       // std::span<std::byte> over the whole storage [base, capacity)
 a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 ```
@@ -427,8 +462,16 @@ be addressable from the CPU.
 
 ### Error Handling
 
-Failures are reported through the `m_error` field using `arena_error`
-(`no_error`, `stack_overflow`, `alloc_failed`, `custom`) rather than exceptions.
+Failures are reported through `arena::error()` using `arena_error` (`no_error`,
+`stack_overflow`, `alloc_failed`, `custom`) rather than exceptions:
+
+```cpp
+ENGRAM_STACK_ARENA(a, 1 << 30);
+if (!a.is_valid() && a.error() == arena_error::stack_overflow) { /* too big */ }
+```
+
+An exhausted arena also records `alloc_failed` when a `push_array` /
+`push_string` request does not fit, and returns an empty span or view.
 
 By default, exceptions thrown by the constructors of the objects you push are
 propagated: if an element's constructor throws, `push`/`push_array` roll back the
@@ -651,7 +694,7 @@ kernel, an RTOS task, or bare metal:
 alignas(std::max_align_t) static std::byte pool[64 * 1024];
 
 auto a = engram::arena::adopt(pool, sizeof(pool), engram::flags::commit);
-auto scratch = engram::arena::stack(1024, /*fallbackToHeap=*/false);
+ENGRAM_STACK_ARENA(scratch, 1024);
 ```
 
 You usually don't have to define it yourself: the header turns the mode on
@@ -669,7 +712,8 @@ system passes in. It also implies `ENGRAM_DISABLE_PMR`, since
 **What you keep:** stack and adopted arenas, and every arena feature built on
 them — `push` / `push_array` / `push_string`, the matching `pop`s (including
 `ENGRAM_EASY_POP`), `save` / `restore`, `reset`, `partition`, `data`, and all the
-introspection accessors.
+introspection accessors. `ENGRAM_STACK_ARENA` works unchanged; the size check
+uses `ENGRAM_FREESTANDING_STACKSZ` instead of asking the OS.
 
 **What is compiled out:**
 
@@ -770,6 +814,39 @@ reserved (e.g. `vm.nr_hugepages`) and does not need a policy change.
 counts against the process working-set minimum. Call `arena::unpin()` to release
 the lock.
 
+## Tests
+
+The suite is built on [CppUTest](https://github.com/cpputest/cpputest) and lives
+in [`tests/`](tests). Configure with `ENGRAM_BUILD_TESTS=ON`; CMake reuses an
+installed CppUTest if `find_package` locates one, and otherwise fetches v4.0 from
+GitHub:
+
+```bash
+cmake -S . -B build -DENGRAM_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Each file covers one build shape, and each is compiled directly against the
+sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
+
+| Test file                                                    | Build under test                                       |
+| ------------------------------------------------------------ | ------------------------------------------------------ |
+| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL)              |
+| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`                               |
+| [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
+
+Coverage spans the allocation flags, each `memory_source` (including real
+`ENGRAM_STACK_ARENA` storage, which the macro makes testable), `arena_error`
+reporting, push/pop and array/string round-trips (including destructor calls,
+alignment, allocation counting and exhaustion), partitions, and save/restore. The
+freestanding suite additionally `static_assert`s that the hosted surface
+(`arena::heap`, `arena::stack`, `arena::unpin`, `arena::sync`) is genuinely gone.
+`test_single_h.cpp` uses CppUTestExt's mocking to stand up a fake backend and
+check that `create_custom` calls the allocator once and the free hook once, on
+destruction. Real vendor runtimes (CUDA, Vulkan, DX12, …) are out of scope — they
+need device handles no CI machine is guaranteed to have.
+
 ## Python bindings
 
 A [pybind11](https://github.com/pybind/pybind11) wrapper for engram's public
@@ -811,12 +888,16 @@ engram.warm_cache(mv, engram.CacheLocality.L1, engram.IO.READ)
 engram.prefetch(buf)
 ```
 
-What's exposed: the `Arena` factories (`create`, `stack`, `heap`, `adopt`),
+What's exposed: the `Arena` factories (`create`, `heap`, `adopt`),
 byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`, `partition`),
 scoped rewind (`save`, `restore`, `save_depth`), introspection
 (`used`, `capacity`, `remaining`, `count`, `total`, `source`, `data`, `is_valid`,
 `empty`), `prefetch` / `warm_cache` / `sync` / `reset` / `unpin`, the `MemorySource`,
 `CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
+
+Stack arenas are **not** exposed: they depend on `alloca` reserving space in the
+caller's C++ stack frame, which has no meaning from Python. Use `Arena.heap` or
+`Arena.adopt` over a `bytearray` instead.
 
 `count` / `total` reflect the per-allocation counters; build the extension with
 `-DENGRAM_DISABLE_TRACKING=ON` (CMake) to drop them, after which both always read `0`.

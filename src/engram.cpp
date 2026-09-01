@@ -154,7 +154,6 @@
 // _mm_prefetch and __builtin_prefetch both require constant hint arguments, so the runtime
 // rw / locality pair is dispatched to a call with literal hints here.
 #ifdef _MSC_VER
-#define StackAllocate(sz) _alloca(sz)
 #include <intrin.h> // Required for MSVC intrinsics
 namespace engram::detail {
 inline void prefetch_hint(const void* addr, int rw, int locality)
@@ -177,7 +176,6 @@ inline void prefetch_hint(const void* addr, int rw, int locality)
 #define PrefetchIntoCache(addr, rw, locality) \
     ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #elif __GNUC__
-#define StackAllocate(sz) __builtin_alloca(sz)
 namespace engram::detail {
 inline void prefetch_hint(const void* addr, int rw, int locality)
 {
@@ -202,8 +200,7 @@ inline void prefetch_hint(const void* addr, int rw, int locality)
 #define PrefetchIntoCache(addr, rw, locality) \
     ::engram::detail::prefetch_hint((const void*)(addr), (int)(rw), (int)(locality))
 #else
-#warning "StackAllocate and PrefetchIntoCache macros are not defined for this compiler. Please define them appropriately."
-#define StackAllocate(sz)
+#warning "The PrefetchIntoCache macro is not defined for this compiler. Please define it appropriately."
 #define PrefetchIntoCache(addr, rw, locality) ((void)(addr), (void)(rw), (void)(locality))
 #endif
 
@@ -715,34 +712,23 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
         size = ((size / pagesz) + 1) * pagesz;
     }
 
-    switch (type) 
+    // Stack arenas come from ENGRAM_STACK_ARENA; external and custom from
+    // adopt / create_custom.
+    if (type == memory_source::heap)
     {
-        case memory_source::stack: 
+        heap_allocate(d, flags, alignment, fd);
+
+        if (d.m_ptr != nullptr) 
         {
-            auto stacksz = get_total_stack_space();
-            if (!(flags & engram::flags::heap_fallback) && (size >= stacksz)) 
-                d.m_error = arena_error::stack_overflow;
-            else if ((flags & engram::flags::heap_fallback) && (size > stacksz))
-                heap_allocate(d, flags, alignment, fd);
-            else 
-                d.m_ptr = (std::byte*)StackAllocate(size); 
-            break;
+            if (flags & engram::flags::commit)
+                memset(d.m_ptr, 0, size);
         }
-
-        case memory_source::heap:
-        {
-            heap_allocate(d, flags, alignment, fd);
-
-            if (d.m_ptr != nullptr) 
-            {
-                if (flags & engram::flags::commit)
-                    memset(d.m_ptr, 0, size);
-            }
-            else d.m_error = arena_error::alloc_failed;
-            break;
-        }
-
-        default: assert(false); break;
+        else d.m_error = arena_error::alloc_failed;
+    }
+    else
+    {
+        assert(false && "engram::arena::create only builds heap arenas");
+        d.m_error = arena_error::alloc_failed;
     }
 
     return result;
@@ -966,6 +952,27 @@ arena arena::make_external(std::byte* storage, std::size_t size, int32_t flags)
     return result;
 }
 
+bool stack_fits(std::size_t size)
+{
+    return size < get_total_stack_space();
+}
+
+arena arena::wrap_stack(void* storage, std::size_t size, int32_t flags)
+{
+    if (!storage)
+    {
+        arena result;
+        auto& d = *result.m_impl;
+        d.m_type = memory_source::stack;
+        d.m_error = arena_error::stack_overflow;
+        return result;
+    }
+
+    auto result = make_external((std::byte*)storage, size, flags);
+    result.m_impl->m_type = memory_source::stack;
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // PIMPL bookkeeping helpers used by the header-side templates.
 // ---------------------------------------------------------------------------
@@ -1051,26 +1058,29 @@ std::pair<std::byte*, std::size_t> arena::unreserve_tracked(bool countable)
 #endif
 
 // ---------------------------------------------------------------------------
-// Introspection accessors.
+// Introspection accessors. A moved-from arena has no impl, and must still read
+// as an empty arena rather than dereferencing a null pointer.
 // ---------------------------------------------------------------------------
-bool arena::is_valid() const noexcept { return m_impl->m_ptr != nullptr; }
-bool arena::empty() const noexcept { return m_impl->m_offset == 0; }
-std::size_t arena::used() const noexcept { return m_impl->m_offset; }
-std::size_t arena::capacity() const noexcept { return m_impl->m_size; }
-std::size_t arena::remaining() const noexcept { return m_impl->m_size - m_impl->m_offset; }
+bool arena::is_valid() const noexcept { return m_impl && m_impl->m_ptr != nullptr; }
+bool arena::empty() const noexcept { return !m_impl || m_impl->m_offset == 0; }
+std::size_t arena::used() const noexcept { return m_impl ? m_impl->m_offset : 0; }
+std::size_t arena::capacity() const noexcept { return m_impl ? m_impl->m_size : 0; }
+std::size_t arena::remaining() const noexcept { return m_impl ? m_impl->m_size - m_impl->m_offset : 0; }
 #ifndef ENGRAM_DISABLE_TRACKING
-std::size_t arena::count() const noexcept { return m_impl->m_count; }
-std::size_t arena::total() const noexcept { return m_impl->m_total; }
+std::size_t arena::count() const noexcept { return m_impl ? m_impl->m_count : 0; }
+std::size_t arena::total() const noexcept { return m_impl ? m_impl->m_total : 0; }
 #else
 std::size_t arena::count() const noexcept { return 0; }
 std::size_t arena::total() const noexcept { return 0; }
 #endif
-memory_source arena::source() const noexcept { return m_impl->m_type; }
+memory_source arena::source() const noexcept { return m_impl ? m_impl->m_type : memory_source::external; }
+arena_error arena::error() const noexcept { return m_impl ? m_impl->m_error : arena_error::no_error; }
 
 std::span<std::byte> arena::data() const noexcept
 {
-    auto& d = *m_impl;
-    return d.m_ptr ? std::span<std::byte>{ d.m_ptr, d.m_size } : std::span<std::byte>{};
+    if (!m_impl || !m_impl->m_ptr)
+        return {};
+    return { m_impl->m_ptr, m_impl->m_size };
 }
 
 arena arena::partition(std::size_t start, std::size_t size, int32_t flags)
@@ -1088,7 +1098,7 @@ arena::~arena()
     auto& d = *m_impl;
     switch (d.m_type)
     {
-        case memory_source::stack: if (d.m_ptr) { memset(d.m_ptr, 0, d.m_size); } break;
+        case memory_source::stack: if (d.m_ptr && d.m_clear_on_free) { memset(d.m_ptr, 0, d.m_size); } break;
         case memory_source::heap: heap_free(d); break;
         case memory_source::external: break;
         case memory_source::custom: if (d.m_extra) ((void(*)(impl_data&))d.m_extra)(d); break;

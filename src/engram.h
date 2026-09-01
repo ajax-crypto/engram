@@ -28,6 +28,16 @@
 #include <memory_resource>
 #endif
 
+#ifdef _MSC_VER
+#include <malloc.h>
+#define ENGRAM_STACK_ALLOC(sz) _alloca(sz)
+#elif defined(__GNUC__)
+#define ENGRAM_STACK_ALLOC(sz) __builtin_alloca(sz)
+#else
+#warning "ENGRAM_STACK_ALLOC is not defined for this compiler; ENGRAM_STACK_ARENA will not work."
+#define ENGRAM_STACK_ALLOC(sz) nullptr
+#endif
+
 #ifdef ENGRAM_EASY_POP
 #ifndef ENGRAM_MAX_ARRAY_STACKSZ
 #define ENGRAM_MAX_ARRAY_STACKSZ 64
@@ -102,7 +112,7 @@ enum class custom { CUDA, ROCm, Vulkan, DX12, OpenCL, SYCL, LevelZero, WebGPU, D
 namespace flags 
 { 
     constexpr int32_t none = 0;              ///< No flags.
-    constexpr int32_t heap_fallback = 1;     ///< Stack arenas fall back to the heap when too large.
+    constexpr int32_t heap_fallback = 1;     ///< Fall back to a heap allocation when the backend allocation fails.
     constexpr int32_t true_contiguous = 2;   ///< Request physically-contiguous / huge pages.
     constexpr int32_t page_aligned = 4;      ///< Round size up to and align on the page size.
     constexpr int32_t commit = 8;            ///< Zero-initialise the storage on creation.
@@ -131,6 +141,12 @@ void warm_cache(std::byte* ptr, std::size_t size, cache_locality locality, int32
  * @return `true` if the OS accepted the prefetch request.
  */
 bool prefetch(std::byte* ptr, std::size_t size);
+
+/**
+ * @brief Check a request against the calling thread's total stack size.
+ * @return `true` if @p size bytes can plausibly be taken from the stack.
+ */
+bool stack_fits(std::size_t size);
 
 /** @brief Typed overload of @ref warm_cache; warms `sizeof(T)` bytes at @p ptr. */
 template <typename T>
@@ -239,7 +255,8 @@ public:
 	
 	/**
 	 * @brief Create an arena backed by @p type.
-	 * @param type      Memory source (stack / heap / …).
+	 * @param type      Memory source (heap / external / custom). @ref memory_source::stack
+	 *                  is not creatable here — use @ref ENGRAM_STACK_ARENA.
 	 * @param size      Requested capacity in bytes.
 	 * @param flags     Bitwise-OR of @ref flags values.
 	 * @param alignment Minimum alignment of the storage.
@@ -250,14 +267,16 @@ public:
         std::size_t alignment = alignof(std::max_align_t), int fd = -1);
 
     /**
-     * @brief Create a stack (`alloca`) arena.
-     * @param size           Capacity in bytes.
-     * @param fallbackToHeap Fall back to the heap when the request is too large for the stack.
+     * @brief Adopt stack storage the caller has already reserved.
+     *
+     * @details Do not call this directly — use @ref ENGRAM_STACK_ARENA. `alloca` memory
+     * is released when the function that requested it returns, so the reservation has to
+     * happen in the frame that will use the arena.
+     * @param storage Stack address to bind, or `nullptr` to record @ref arena_error::stack_overflow.
+     * @param size    Size of the reservation in bytes.
+     * @param flags   @ref flags (e.g. `commit`, `no_clear`).
      */
-    [[nodiscard]] static arena stack(std::size_t size, bool fallbackToHeap)
-    {
-        return create(memory_source::stack, size, fallbackToHeap ? engram::flags::heap_fallback : 0);
-    }
+    [[nodiscard]] static arena wrap_stack(void* storage, std::size_t size, int32_t flags = 0);
 
     /**
      * @brief Create a heap arena (page-aligned; optionally physically contiguous).
@@ -423,7 +442,8 @@ public:
 #if defined(ENGRAM_MASK_EXCEPTIONS)
 				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
                 {
-                    unreserve(sizeof(T) * (size - idx), true);
+                    // The truncated array is still live, so it stays counted.
+                    unreserve(sizeof(T) * (size - idx), false);
                     return { valptr, idx + 1u };
                 }
 #else
@@ -485,7 +505,8 @@ public:
 #if defined(ENGRAM_MASK_EXCEPTIONS)
 				if (!initialize<T>((std::byte*)ptr, std::forward<ArgsT>(args)...))
                 {
-                    unreserve(sizeof(T) * (size - idx), true);
+                    // The truncated array is still live, so it stays counted.
+                    unreserve(sizeof(T) * (size - idx), false);
                     return { valptr, idx + 1u };
                 }
 #else
@@ -531,7 +552,7 @@ public:
 	template <typename T>
 	void pop() 
 	{ 
-		release<T>(unreserve(sizeof(T), false));
+		release<T>(unreserve(sizeof(T), true));
 	}
 
     /** @brief Destroy and pop a runtime-sized `T` array (@p size elements). */
@@ -673,9 +694,10 @@ public:
     std::size_t used() const noexcept;     ///< @return Bytes currently in use.
     std::size_t capacity() const noexcept; ///< @return Total capacity in bytes.
     std::size_t remaining() const noexcept;///< @return Bytes still available.
-    std::size_t count() const noexcept;    ///< @return Live array/string allocation count.
-    std::size_t total() const noexcept;    ///< @return Lifetime array/string allocation count.
+    std::size_t count() const noexcept;    ///< @return Live allocation count (every `push*` that has not been popped).
+    std::size_t total() const noexcept;    ///< @return Lifetime allocation count.
     memory_source source() const noexcept; ///< @return The arena's @ref memory_source.
+    arena_error error() const noexcept;    ///< @return The error recorded during creation.
 
     /**
      * @brief Access the arena's underlying storage as a contiguous byte range.
@@ -702,3 +724,32 @@ public:
 };
 
 } // namespace engram
+
+#define ENGRAM_STACK_ARENA_EXPAND_(x) x
+#define ENGRAM_STACK_ARENA_IMPL_(varname, size, flags, ...)                        \
+    const std::size_t varname##_engram_size_ = (std::size_t)(size);               \
+    void* varname##_engram_storage_ = engram::stack_fits(varname##_engram_size_)   \
+        ? ENGRAM_STACK_ALLOC(varname##_engram_size_)                               \
+        : nullptr;                                                                 \
+    engram::arena varname = engram::arena::wrap_stack(                             \
+        varname##_engram_storage_, varname##_engram_size_, (flags))
+
+/**
+ * @brief Declare a stack-backed arena named @p varname in the current scope.
+ *
+ * @details `alloca` storage belongs to the frame that requests it, so this has to be
+ * a macro: a factory function would hand back a pointer into its own dead frame. The
+ * arena is therefore usable only within the enclosing scope, and its storage is gone
+ * once that scope exits.
+ *
+ * Usage: `ENGRAM_STACK_ARENA(scratch, 4096)` or
+ * `ENGRAM_STACK_ARENA(scratch, 4096, engram::flags::commit)`.
+ *
+ * The request is checked against the thread's stack size first; if it does not fit,
+ * @p varname is an invalid arena reporting @ref engram::arena_error::stack_overflow
+ * rather than a smashed stack. Two extra names (`<varname>_engram_size_` and
+ * `<varname>_engram_storage_`) are declared alongside it, so the macro needs a block
+ * scope rather than a bare `if` branch.
+ */
+#define ENGRAM_STACK_ARENA(varname, ...) \
+    ENGRAM_STACK_ARENA_EXPAND_(ENGRAM_STACK_ARENA_IMPL_(varname, __VA_ARGS__, engram::flags::none, 0))

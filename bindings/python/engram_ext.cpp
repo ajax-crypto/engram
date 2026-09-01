@@ -96,11 +96,6 @@ PYBIND11_MODULE(_engram, m)
             py::arg("alignment") = alignof(std::max_align_t),
             "Create an arena for the given memory_source.")
         .def_static(
-            "stack",
-            [](std::size_t size, bool fallback_to_heap) { return arena::stack(size, fallback_to_heap); },
-            py::arg("size"), py::arg("fallback_to_heap") = true,
-            "Stack (alloca) arena, optionally falling back to the heap.")
-        .def_static(
             "heap",
             [](std::size_t size, bool true_contiguous, std::size_t alignment) {
                 return arena::heap(size, true_contiguous, alignment);
@@ -194,9 +189,9 @@ PYBIND11_MODULE(_engram, m)
         .def_property_readonly("capacity", &arena::capacity)
         .def_property_readonly("remaining", &arena::remaining)
         .def_property_readonly("count", &arena::count,
-                               "Live array/string allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
+                               "Live allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
         .def_property_readonly("total", &arena::total,
-                               "Lifetime array/string allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
+                               "Lifetime allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
         .def_property_readonly("source", &arena::source)
         .def(
             "data",

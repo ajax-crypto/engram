@@ -19,6 +19,7 @@ option(ENGRAM_SINGLE_HEADER
 option(ENGRAM_ALL         "Enable every backend supported on the current platform." OFF)
 option(ENGRAM_DISABLE_PMR "Disable std::pmr integration."                           OFF)
 option(ENGRAM_EASY_POP    "Enable the fixed-size array pop helpers."                 OFF)
+option(ENGRAM_BUILD_TESTS "Build the CppUTest-based test suite."                    OFF)
 
 # ---------------------------------------------------------------------------
 # Per-backend options (map 1:1 to ENGRAM_ENABLE_* preprocessor defines)
@@ -82,3 +83,11 @@ add_library(engram::engram ALIAS engram)
 
 target_compile_features(engram ${ENGRAM_SCOPE} cxx_std_20)
 target_compile_definitions(engram ${ENGRAM_SCOPE} ${ENGRAM_DEFINITIONS})
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(ENGRAM_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
