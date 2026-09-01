@@ -59,7 +59,8 @@ using namespace engram;
 ```
 
 `engram` requires **C++20** (it uses `std::span`, `if constexpr`, fold
-expressions, and `std::align_val_t`).
+expressions, and `std::align_val_t`). Build it as C++23 and the `std::mdspan`
+helpers appear on their own.
 
 ## Choosing a layout: single header vs. header + source
 
@@ -270,6 +271,40 @@ Define `ENGRAM_EASY_POP` and the arena remembers each array/string size (up to
 a.pop_array<float>();               // size recalled automatically
 ```
 
+### Multi-dimensional arrays (`std::mdspan`)
+
+`push_md_array` reserves a block and hands it back as a `std::mdspan`. There is
+nothing to switch on: the header checks `__cpp_lib_mdspan` and defines the helpers
+whenever you compile as C++23 against a standard library that ships `<mdspan>`.
+Guard your own code with `ENGRAM_HAS_MDSPAN` if it also has to build as C++20.
+
+```cpp
+auto grid = a.push_md_array<int, 2>({ 2, 3 });    // 2 rows x 3 columns
+grid[1, 2] = 7;                                    // C++23 multi-arg subscript
+a.pop_md_array(grid);
+```
+
+The rank `N` is a template parameter because a braced list is a non-deduced
+context. Pass it explicitly as above, or hand over a real `std::array` and let it
+deduce:
+
+```cpp
+constexpr std::array<std::size_t, 3> shape{ 2, 3, 4 };
+auto volume = a.push_md_array<float>(shape);       // N deduced as 3
+```
+
+Trailing arguments initialize every element, exactly like `push_array`:
+
+```cpp
+auto cells = a.push_md_array<Cell, 2>({ 8, 8 }, Cell::empty);
+```
+
+The layout and accessor policies follow the rank, so a column-major block is
+`push_md_array<int, 2, std::layout_left>({ 2, 3 })`. The reservation is sized from
+the layout mapping's `required_span_size()`, so padded layouts get the storage they
+actually index — which is why `pop_md_array` takes the mdspan rather than a count.
+An exhausted arena yields an empty mdspan and records `arena_error::alloc_failed`.
+
 Introspection helpers:
 
 ```cpp
@@ -282,6 +317,7 @@ a.count();      // live allocation count
 a.total();      // lifetime allocation count
 a.source();     // the memory_source backing this arena
 a.error();      // the arena_error recorded during creation
+a.origin();     // where it was created (with ENGRAM_ENABLE_SOURCE_INFO)
 a.data();       // std::span<std::byte> over the whole storage [base, capacity)
 a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 ```
@@ -504,6 +540,51 @@ no arena operation ever throws:
 The macro only takes effect when the compiler has exceptions enabled; with exceptions
 disabled it is a no-op (engram emits no `try`/`catch`). Freestanding builds define it
 automatically — see [Freestanding Builds](#freestanding-builds).
+
+### Creation-site tracking
+
+Define `ENGRAM_ENABLE_SOURCE_INFO` and every factory gains a trailing
+`std::source_location` parameter defaulted to `std::source_location::current()`, so
+each arena remembers where it was created. `arena::origin()` reads it back:
+
+```cpp
+auto a = arena::heap(1 << 20);
+std::printf("arena from %s:%u (%s)\n",
+            a.origin().file_name(), a.origin().line(), a.origin().function_name());
+```
+
+Because the default argument is evaluated at the **call site**, the location is your
+code, not a line inside engram — including through `ENGRAM_STACK_ARENA`, which
+records the line the macro was written on. `partition` records its own call site
+rather than the parent's, so a sub-arena points at the code that carved it out.
+
+It is enabled automatically in debug builds (`_DEBUG`); define
+`ENGRAM_DISABLE_SOURCE_INFO` to opt out, or `ENGRAM_ENABLE_SOURCE_INFO` explicitly to
+get it in a release build.
+
+Where it earns its keep:
+
+- **Which arena ran out?** An allocation returning an empty span tells you nothing
+  about which of a dozen arenas overflowed. Logging `origin()` next to
+  `used()`/`capacity()` names the one to resize.
+- **Whose pointer is this?** A dangling pointer into a released arena is otherwise
+  anonymous. Print the origin in your teardown or watchdog path to identify the
+  arena the memory came from.
+- **Stale sub-arenas.** `partition` hands out views that must not outlive the parent;
+  a partition's origin points straight at the call that created the view.
+- **Leaked scratch.** Pair `origin()` with `count()` when an arena is destroyed
+  non-empty to find the scope that forgot to `pop` or `restore`.
+
+```cpp
+if (!a.is_valid())
+    log("arena at {}:{} failed: {}", a.origin().file_name(), a.origin().line(),
+        (int)a.error());
+```
+
+> The parameter is part of the signature, so `ENGRAM_ENABLE_SOURCE_INFO` must match
+> between the library build and everything that includes the header. With the header
+> + source layout that means defining it for `engram.cpp` too — the CMake option does
+> this for you.
 
 ## Optional Backends
 
@@ -787,12 +868,96 @@ Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-heade
 For a target with no OS, heap, or vendor runtime, use the single header with
 `ENGRAM_ENABLE_FREESTANDING` — see [Freestanding Builds](#freestanding-builds).
 
-The provided `CMakeLists.txt` exposes `ENGRAM_SINGLE_HEADER` (default `ON`) to
-switch between the two, plus an `ENGRAM_ENABLE_*` option per backend. Either way,
-enable optional backends by defining the relevant `ENGRAM_ENABLE_*` macro and
-linking against that backend's SDK (CUDA, HIP, Vulkan, OpenCL, SYCL, Level Zero,
-WebGPU, DPDK, PMDK `libpmem`, RDMA `libibverbs`, GPUDirect `cufile`, etc.). For
-the header + source layout, define those macros for the `engram.cpp` build too.
+### CMake options
+
+Every option maps 1:1 to the preprocessor macro of the same name (except
+`ENGRAM_SINGLE_HEADER` and `ENGRAM_BUILD_TESTS`, which only shape the build) and is
+applied to the `engram` target, so anything linking `engram::engram` inherits it.
+
+| Option                     | Default | Effect                                                                    |
+| -------------------------- | ------- | ------------------------------------------------------------------------- |
+| `ENGRAM_SINGLE_HEADER`     | `ON`    | `ON` builds an INTERFACE target over `single_header/`; `OFF` compiles `src/engram.cpp` into a static library. |
+| `ENGRAM_BUILD_TESTS`       | `OFF`   | Build the CppUTest suite and register it with CTest.                      |
+| `ENGRAM_ALL`               | `OFF`   | Turn on every backend available on the current platform.                  |
+| `ENGRAM_DISABLE_PMR`       | `OFF`   | Drop `get_pmr_resource` and the `<memory_resource>` include.              |
+| `ENGRAM_EASY_POP`          | `OFF`   | Remember each array/string size so `pop_array<T>()` needs no count.       |
+| `ENGRAM_ENABLE_SOURCE_INFO`| `OFF`   | Record each arena's creation site; on automatically in `_DEBUG` builds.   |
+| `ENGRAM_ENABLE_VULKAN`     | `OFF`   | Vulkan device memory.                                                     |
+| `ENGRAM_ENABLE_DX12`       | `OFF`   | DirectX 12 (Windows).                                                     |
+| `ENGRAM_ENABLE_CUDA`       | `OFF`   | NVIDIA CUDA.                                                              |
+| `ENGRAM_ENABLE_ROCM`       | `OFF`   | AMD ROCm / HIP.                                                           |
+| `ENGRAM_ENABLE_XDNA`       | `OFF`   | AMD XDNA via XRT.                                                         |
+| `ENGRAM_ENABLE_OPENCL`     | `OFF`   | OpenCL SVM.                                                               |
+| `ENGRAM_ENABLE_SYCL`       | `OFF`   | SYCL shared USM.                                                          |
+| `ENGRAM_ENABLE_LEVEL_ZERO` | `OFF`   | oneAPI Level Zero USM.                                                    |
+| `ENGRAM_ENABLE_WEBGPU`     | `OFF`   | WebGPU mapped buffer.                                                     |
+| `ENGRAM_ENABLE_PMDK`       | `OFF`   | PMDK persistent memory.                                                   |
+| `ENGRAM_ENABLE_DPDK`       | `OFF`   | DPDK memory zones (Linux).                                                |
+| `ENGRAM_ENABLE_RDMA`       | `OFF`   | RDMA-registered memory (Linux).                                           |
+| `ENGRAM_ENABLE_GPUDIRECT`  | `OFF`   | CUDA GPUDirect Storage (Linux).                                           |
+| `ENGRAM_ENABLE_DMABUF`     | `OFF`   | Linux dma-buf heaps.                                                      |
+
+Macros without a CMake option — `ENGRAM_MASK_EXCEPTIONS`, `ENGRAM_DISABLE_TRACKING`,
+`ENGRAM_DISABLE_SOURCE_INFO`, `ENGRAM_ENABLE_FREESTANDING`, `ENGRAM_ENABLE_FSEXTRA`,
+`ENGRAM_MAX_SAVE_STACKSZ`, `ENGRAM_MAX_ARRAY_STACKSZ`, `ENGRAM_FREESTANDING_STACKSZ`
+and the `ENGRAM_*_HEADER` overrides — are set the usual way:
+
+```bash
+cmake -S . -B build -DCMAKE_CXX_FLAGS="-DENGRAM_MASK_EXCEPTIONS -DENGRAM_MAX_SAVE_STACKSZ=64"
+```
+
+`push_md_array` has no option of its own — it appears whenever the compiler is in
+C++23 mode with `<mdspan>` available:
+
+```bash
+cmake -S . -B build -DCMAKE_CXX_STANDARD=23
+```
+
+### Command line examples
+
+```bash
+# Default: header-only, no backends.
+cmake -S . -B build
+cmake --build build
+
+# Header + source, release build.
+cmake -S . -B build -DENGRAM_SINGLE_HEADER=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# C++23 — the std::mdspan helpers come along automatically.
+cmake -S . -B build -DCMAKE_CXX_STANDARD=23
+cmake --build build
+
+# Debug build with creation-site tracking and the easy-pop helpers.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
+                    -DENGRAM_ENABLE_SOURCE_INFO=ON -DENGRAM_EASY_POP=ON
+cmake --build build
+
+# Run the test suite.
+cmake -S . -B build -DENGRAM_BUILD_TESTS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+
+# A device backend (link the SDK yourself).
+cmake -S . -B build -DENGRAM_ENABLE_CUDA=ON
+
+# Multi-config generators pick the configuration at build time.
+cmake -S . -B build -G "Visual Studio 17 2022" -DENGRAM_SINGLE_HEADER=OFF
+cmake --build build --config Release
+```
+
+Consume it from another project with:
+
+```cmake
+add_subdirectory(engram)
+target_link_libraries(my_app PRIVATE engram::engram)
+```
+
+Enabling a backend only defines its macro; you still link that backend's SDK
+yourself (CUDA, HIP, Vulkan, OpenCL, SYCL, Level Zero, WebGPU, DPDK, PMDK
+`libpmem`, RDMA `libibverbs`, GPUDirect `cufile`, …). If you compile
+`src/engram.cpp` by hand rather than through the bundled CMake, define the same
+macros for that translation unit.
 
 On Apple platforms, link the `Metal`, `Foundation`, and `QuartzCore` frameworks.
 When using metal-cpp (`ENGRAM_METAL_CPP`), define `ENGRAM_METAL_PRIVATE_IMPL` in
@@ -850,22 +1015,26 @@ sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
 
 | Test file                                                    | Build under test                                       |
 | ------------------------------------------------------------ | ------------------------------------------------------ |
-| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built twice — with and without `ENGRAM_MASK_EXCEPTIONS` |
-| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, built twice — with and without `ENGRAM_MASK_EXCEPTIONS` |
+| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built plain, with `ENGRAM_MASK_EXCEPTIONS`, with `ENGRAM_ENABLE_SOURCE_INFO`, and once as C++23 |
+| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same four configurations      |
 | [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
+
+The C++23 targets are added only when `check_include_file_cxx` finds `<mdspan>`,
+so a C++20-only toolchain still builds the rest of the suite.
 
 Coverage spans the allocation flags, each `memory_source` (including real
 `ENGRAM_STACK_ARENA` storage, which the macro makes testable), `arena_error`
 reporting, element construction, push/pop and array/string round-trips (including
 destructor calls, alignment, allocation counting and exhaustion), partitions,
-save/restore, and both exception policies — rollback-and-rethrow by default,
-truncated spans and swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The
-freestanding suite additionally `static_assert`s that the hosted surface
-(`arena::heap`, `arena::stack`, `arena::unpin`, `arena::sync`) is genuinely gone.
-`test_single_h.cpp` uses CppUTestExt's mocking to stand up a fake backend and
-check that `create_custom` calls the allocator once and the free hook once, on
-destruction. Real vendor runtimes (CUDA, Vulkan, DX12, …) are out of scope — they
-need device handles no CI machine is guaranteed to have.
+save/restore, `push_md_array` shape/layout/initialization, creation-site capture,
+and both exception policies — rollback-and-rethrow by default, truncated spans and
+swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The freestanding suite additionally
+`static_assert`s that the hosted surface (`arena::heap`, `arena::stack`,
+`arena::unpin`, `arena::sync`) is genuinely gone. `test_single_h.cpp` uses
+CppUTestExt's mocking to stand up a fake backend and check that `create_custom`
+calls the allocator once and the free hook once, on destruction. Real vendor
+runtimes (CUDA, Vulkan, DX12, …) are out of scope — they need device handles no
+CI machine is guaranteed to have.
 
 ## Python bindings
 

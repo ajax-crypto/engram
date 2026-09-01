@@ -1000,6 +1000,202 @@ TEST(MaskedExceptions, ThrowingDestructorsAreIgnored)
 #endif // ENGRAM_MASK_EXCEPTIONS
 #endif // exceptions enabled
 
+#ifdef ENGRAM_HAS_MDSPAN
+
+// ---------------------------------------------------------------------------
+// Multi-dimensional arrays
+// ---------------------------------------------------------------------------
+TEST_GROUP(MdArray)
+{
+    void setup() override { Tracked::reset(); }
+};
+
+TEST(MdArray, ShapeAndStorageMatchTheExtents)
+{
+    auto a = arena::heap(4096);
+
+    auto md = a.push_md_array<int, 2>({ 2, 3 });
+
+    UNSIGNED_LONGS_EQUAL(2u, md.rank());
+    UNSIGNED_LONGS_EQUAL(2u, md.extent(0));
+    UNSIGNED_LONGS_EQUAL(3u, md.extent(1));
+    UNSIGNED_LONGS_EQUAL(6u, md.size());
+    UNSIGNED_LONGS_EQUAL(aligned(6 * sizeof(int)), a.used());
+    POINTERS_EQUAL(a.data().data(), (std::byte*)md.data_handle());
+}
+
+TEST(MdArray, IndexingIsRowMajorByDefault)
+{
+    auto a = arena::heap(4096);
+
+    auto md = a.push_md_array<int, 2>({ 2, 3 });
+    for (std::size_t r = 0; r < md.extent(0); ++r)
+        for (std::size_t c = 0; c < md.extent(1); ++c)
+            md[r, c] = static_cast<int>(r * 10 + c);
+
+    // layout_right lays rows out contiguously.
+    auto* flat = md.data_handle();
+    LONGS_EQUAL(0, flat[0]);
+    LONGS_EQUAL(1, flat[1]);
+    LONGS_EQUAL(2, flat[2]);
+    LONGS_EQUAL(10, flat[3]);
+    LONGS_EQUAL(11, flat[4]);
+    LONGS_EQUAL(12, flat[5]);
+}
+
+TEST(MdArray, ColumnMajorLayoutIsHonoured)
+{
+    auto a = arena::heap(4096);
+
+    auto md = a.push_md_array<int, 2, std::layout_left>({ 2, 3 });
+    for (std::size_t r = 0; r < md.extent(0); ++r)
+        for (std::size_t c = 0; c < md.extent(1); ++c)
+            md[r, c] = static_cast<int>(r * 10 + c);
+
+    auto* flat = md.data_handle();
+    LONGS_EQUAL(0, flat[0]);
+    LONGS_EQUAL(10, flat[1]);
+    LONGS_EQUAL(1, flat[2]);
+}
+
+TEST(MdArray, EveryElementIsConstructedFromTheGivenArguments)
+{
+    auto a = arena::heap(4096);
+
+    auto md = a.push_md_array<Tracked, 3>({ 2, 3, 4 }, 9);
+
+    UNSIGNED_LONGS_EQUAL(24u, md.size());
+    LONGS_EQUAL(24, Tracked::constructed);
+    for (std::size_t i = 0; i < md.extent(0); ++i)
+        for (std::size_t j = 0; j < md.extent(1); ++j)
+            for (std::size_t k = 0; k < md.extent(2); ++k)
+                LONGS_EQUAL(9, (md[i, j, k].value));
+
+    a.pop_md_array(md);
+
+    LONGS_EQUAL(24, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(MdArray, RankIsDeducedFromAnExtentsArray)
+{
+    auto a = arena::heap(4096);
+    const std::array<std::size_t, 3> extents{ 2, 3, 4 };
+
+    auto md = a.push_md_array<float>(extents);
+
+    UNSIGNED_LONGS_EQUAL(3u, md.rank());
+    UNSIGNED_LONGS_EQUAL(24u, md.size());
+}
+
+TEST(MdArray, OneDimensionalArraysWork)
+{
+    auto a = arena::heap(4096);
+
+    auto md = a.push_md_array<int, 1>({ 5 }, 3);
+
+    UNSIGNED_LONGS_EQUAL(5u, md.size());
+    for (std::size_t i = 0; i < md.extent(0); ++i)
+        LONGS_EQUAL(3, (md[i]));
+}
+
+TEST(MdArray, ExhaustedArenaReturnsAnEmptyMdspan)
+{
+    alignas(std::max_align_t) unsigned char storage[64];
+    auto a = arena::adopt(storage, sizeof(storage));
+
+    auto md = a.push_md_array<int, 2>({ 64, 64 });
+
+    UNSIGNED_LONGS_EQUAL(0u, md.size());
+    LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(MdArray, ParticipatesInSaveRestore)
+{
+    auto a = arena::heap(4096);
+    auto before = a.used();
+
+    CHECK_TRUE(a.save());
+    auto md = a.push_md_array<int, 2>({ 4, 4 }, 1);
+    UNSIGNED_LONGS_EQUAL(16u, md.size());
+    CHECK_TRUE(a.used() > before);
+
+    CHECK_TRUE(a.restore());
+    UNSIGNED_LONGS_EQUAL(before, a.used());
+}
+
+#endif // ENGRAM_HAS_MDSPAN
+
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+
+// ---------------------------------------------------------------------------
+// Creation-site capture
+// ---------------------------------------------------------------------------
+TEST_GROUP(SourceInfo)
+{
+};
+
+TEST(SourceInfo, HeapArenaRecordsTheCallSite)
+{
+    const auto here = std::source_location::current();
+    auto a = arena::heap(4096);
+
+    STRCMP_EQUAL(here.file_name(), a.origin().file_name());
+    UNSIGNED_LONGS_EQUAL(here.line() + 1, a.origin().line());
+}
+
+TEST(SourceInfo, AdoptRecordsTheCallSite)
+{
+    alignas(std::max_align_t) unsigned char storage[256];
+
+    const auto here = std::source_location::current();
+    auto a = arena::adopt(storage, sizeof(storage));
+
+    UNSIGNED_LONGS_EQUAL(here.line() + 1, a.origin().line());
+}
+
+TEST(SourceInfo, StackArenaMacroRecordsTheCallSite)
+{
+    const auto here = std::source_location::current();
+    ENGRAM_STACK_ARENA(a, 512);
+
+    STRCMP_EQUAL(here.file_name(), a.origin().file_name());
+    UNSIGNED_LONGS_EQUAL(here.line() + 1, a.origin().line());
+}
+
+TEST(SourceInfo, OversizedStackArenaStillRecordsWhereItWasAsked)
+{
+    const auto here = std::source_location::current();
+    ENGRAM_STACK_ARENA(a, std::size_t{ 1 } << 40);
+
+    CHECK_FALSE(a.is_valid());
+    UNSIGNED_LONGS_EQUAL(here.line() + 1, a.origin().line());
+}
+
+TEST(SourceInfo, PartitionRecordsItsOwnCallSite)
+{
+    auto parent = arena::heap(4096);
+
+    const auto here = std::source_location::current();
+    auto sub = parent.partition(0, 512);
+
+    UNSIGNED_LONGS_EQUAL(here.line() + 1, sub.origin().line());
+    CHECK_TRUE(sub.origin().line() != parent.origin().line());
+}
+
+TEST(SourceInfo, OriginSurvivesAMove)
+{
+    auto source = arena::heap(4096);
+    const auto line = source.origin().line();
+
+    auto moved = std::move(source);
+
+    UNSIGNED_LONGS_EQUAL(line, moved.origin().line());
+}
+
+#endif // ENGRAM_ENABLE_SOURCE_INFO
+
 int main(int argc, char** argv)
 {
     return CommandLineTestRunner::RunAllTests(argc, argv);

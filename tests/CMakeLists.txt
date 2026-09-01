@@ -28,12 +28,16 @@ else()
 endif()
 
 function(engram_add_test name)
-    cmake_parse_arguments(ARG "" "" "SOURCES;INCLUDES;DEFINES;LIBS" ${ARGN})
+    cmake_parse_arguments(ARG "" "STANDARD" "SOURCES;INCLUDES;DEFINES;LIBS" ${ARGN})
+
+    if(NOT ARG_STANDARD)
+        set(ARG_STANDARD cxx_std_20)
+    endif()
 
     add_executable(${name} ${ARG_SOURCES})
     target_include_directories(${name} PRIVATE ${ARG_INCLUDES})
     target_compile_definitions(${name} PRIVATE ${ARG_DEFINES})
-    target_compile_features(${name} PRIVATE cxx_std_20)
+    target_compile_features(${name} PRIVATE ${ARG_STANDARD})
     target_link_libraries(${name} PRIVATE ${ENGRAM_CPPUTEST} ${ARG_LIBS})
 
     if(MSVC)
@@ -76,6 +80,19 @@ engram_add_test(engram_test_single_h_masked
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_MASK_EXCEPTIONS
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
+# And again with arena creation sites recorded.
+engram_add_test(engram_test_hcpp_srcinfo
+    SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_SOURCE_INFO
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_single_h_srcinfo
+    SOURCES  test_single_h.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_SOURCE_INFO
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
 engram_add_test(engram_test_freestanding
     SOURCES  test_freestanding.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
@@ -85,3 +102,28 @@ engram_add_test(engram_test_freestanding_fsextra
     SOURCES  test_freestanding.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
     DEFINES  ENGRAM_ENABLE_FREESTANDING ENGRAM_ENABLE_FSEXTRA)
+
+# push_md_array switches itself on when the standard library has <mdspan>, so the
+# only thing needed to cover it is a C++23 build of the same suites.
+include(CheckIncludeFileCXX)
+set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
+check_include_file_cxx(mdspan ENGRAM_HAVE_MDSPAN)
+unset(CMAKE_REQUIRED_FLAGS)
+
+if(ENGRAM_HAVE_MDSPAN)
+    engram_add_test(engram_test_hcpp_cxx23
+        SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+        DEFINES  ${ENGRAM_DEFINITIONS}
+        STANDARD cxx_std_23
+        LIBS     ${ENGRAM_HOSTED_LIBS})
+
+    engram_add_test(engram_test_single_h_cxx23
+        SOURCES  test_single_h.cpp
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+        DEFINES  ${ENGRAM_DEFINITIONS}
+        STANDARD cxx_std_23
+        LIBS     ${ENGRAM_HOSTED_LIBS})
+else()
+    message(STATUS "engram: <mdspan> not available; skipping the push_md_array tests")
+endif()

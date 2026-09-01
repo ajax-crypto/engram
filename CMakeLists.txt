@@ -16,10 +16,11 @@ option(ENGRAM_SINGLE_HEADER
 # ---------------------------------------------------------------------------
 # Feature options
 # ---------------------------------------------------------------------------
-option(ENGRAM_ALL         "Enable every backend supported on the current platform." OFF)
-option(ENGRAM_DISABLE_PMR "Disable std::pmr integration."                           OFF)
-option(ENGRAM_EASY_POP    "Enable the fixed-size array pop helpers."                 OFF)
-option(ENGRAM_BUILD_TESTS "Build the CppUTest-based test suite."                    OFF)
+option(ENGRAM_ALL           "Enable every backend supported on the current platform." OFF)
+option(ENGRAM_DISABLE_PMR   "Disable std::pmr integration."                           OFF)
+option(ENGRAM_EASY_POP      "Enable the fixed-size array pop helpers."                 OFF)
+option(ENGRAM_ENABLE_SOURCE_INFO "Record the creation site of every arena."           OFF)
+option(ENGRAM_BUILD_TESTS   "Build the CppUTest-based test suite."                    OFF)
 
 # ---------------------------------------------------------------------------
 # Per-backend options (map 1:1 to ENGRAM_ENABLE_* preprocessor defines)
@@ -52,6 +53,9 @@ if(ENGRAM_DISABLE_PMR)
 endif()
 if(ENGRAM_EASY_POP)
     list(APPEND ENGRAM_DEFINITIONS ENGRAM_EASY_POP)
+endif()
+if(ENGRAM_ENABLE_SOURCE_INFO)
+    list(APPEND ENGRAM_DEFINITIONS ENGRAM_ENABLE_SOURCE_INFO)
 endif()
 
 foreach(backend

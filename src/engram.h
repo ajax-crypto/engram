@@ -21,11 +21,36 @@
 #include <string_view>
 #include <new>
 #include <array>
+#include <version>
 #include <stdlib.h>
 #include <assert.h>
 
 #ifndef ENGRAM_DISABLE_PMR
 #include <memory_resource>
+#endif
+
+// std::mdspan arrived in C++23; the helpers switch themselves on when the
+// standard library provides it.
+#ifdef __cpp_lib_mdspan
+#include <mdspan>
+#define ENGRAM_HAS_MDSPAN
+#endif
+
+// Debug builds record where each arena came from unless asked not to.
+#if defined(_DEBUG) && !defined(ENGRAM_ENABLE_SOURCE_INFO) && !defined(ENGRAM_DISABLE_SOURCE_INFO)
+#define ENGRAM_ENABLE_SOURCE_INFO
+#endif
+
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+#include <source_location>
+// Appended to every factory so the default argument is evaluated at the call site.
+#define ENGRAM_SOURCE_PARAM , const std::source_location& loc = std::source_location::current()
+#define ENGRAM_SOURCE_DECL  , const std::source_location& loc
+#define ENGRAM_SOURCE_ARG   , loc
+#else
+#define ENGRAM_SOURCE_PARAM
+#define ENGRAM_SOURCE_DECL
+#define ENGRAM_SOURCE_ARG
 #endif
 
 #ifdef _MSC_VER
@@ -264,7 +289,7 @@ private:
 #endif
 
     // Build an arena that adopts external storage (defined in engram.cpp).
-    static arena make_external(std::byte* storage, std::size_t size, int32_t flags);
+    static arena make_external(std::byte* storage, std::size_t size, int32_t flags ENGRAM_SOURCE_PARAM);
 
     // Varargs backend dispatch (defined in engram.cpp). `provided` is the number of
     // backend params that follow; any optional trailing param not provided is filled
@@ -289,7 +314,7 @@ public:
 	 * @return The new arena (check @ref is_valid).
 	 */
 	[[nodiscard]] static arena create(memory_source type, std::size_t size, int32_t flags = 0, 
-        std::size_t alignment = alignof(std::max_align_t), int fd = -1);
+        std::size_t alignment = alignof(std::max_align_t), int fd = -1 ENGRAM_SOURCE_PARAM);
 
     /**
      * @brief Adopt stack storage the caller has already reserved.
@@ -301,7 +326,7 @@ public:
      * @param size    Size of the reservation in bytes.
      * @param flags   @ref flags (e.g. `commit`, `no_clear`).
      */
-    [[nodiscard]] static arena wrap_stack(void* storage, std::size_t size, int32_t flags = 0);
+    [[nodiscard]] static arena wrap_stack(void* storage, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM);
 
     /**
      * @brief Create a heap arena (page-aligned; optionally physically contiguous).
@@ -310,9 +335,9 @@ public:
      * @param alignment      Minimum alignment.
      * @param fd             Optional file descriptor for a file-backed mapping.
      */
-    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1)
+    [[nodiscard]] static arena heap(std::size_t size, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1 ENGRAM_SOURCE_PARAM)
     {
-        return create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : engram::flags::page_aligned, alignment, fd);
+        return create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : engram::flags::page_aligned, alignment, fd ENGRAM_SOURCE_ARG);
     }
 
 #ifdef __linux__
@@ -324,10 +349,10 @@ public:
      * @param alignment      Minimum alignment.
      * @param fd             Optional file descriptor for a file-backed mapping.
      */
-    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1);
+    [[nodiscard]] static arena heap(std::size_t size, std::string_view name, bool trueContiguous = false, std::size_t alignment = alignof(std::max_align_t), int fd = -1 ENGRAM_SOURCE_PARAM);
 
     /** @brief Create a heap arena backed by an anonymous `memfd` named @p name (Linux only). */
-    [[nodiscard]] static arena heapfile(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t));
+    [[nodiscard]] static arena heapfile(std::size_t size, std::string_view name, std::size_t alignment = alignof(std::max_align_t) ENGRAM_SOURCE_PARAM);
 #endif
 
     /**
@@ -338,18 +363,18 @@ public:
      * @param flags   @ref flags (e.g. `commit`, `no_clear`).
      */
     template <typename T>
-    [[nodiscard]] static arena adopt(T* storage, std::size_t size, int32_t flags = 0)
+    [[nodiscard]] static arena adopt(T* storage, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
     {
         assert(storage != nullptr);
-        return make_external((std::byte*)storage, size, flags);
+        return make_external((std::byte*)storage, size, flags ENGRAM_SOURCE_ARG);
     }
 
     /** @brief Adopt a caller-owned C array (size deduced from the array bound). */
     template <typename T, std::size_t size>
-    [[nodiscard]] static arena adopt(T (&storage)[size], int32_t flags = 0)
+    [[nodiscard]] static arena adopt(T (&storage)[size], int32_t flags = 0 ENGRAM_SOURCE_PARAM)
     {
         static_assert(size > 0);
-        return adopt(storage, size, flags);
+        return adopt(storage, size, flags ENGRAM_SOURCE_ARG);
     }
 
     /**
@@ -524,6 +549,49 @@ public:
 		}
 		return { valptr, size };
 	}
+
+#ifdef ENGRAM_HAS_MDSPAN
+    /**
+     * @brief Reserve a multi-dimensional array of `T` and return it as a `std::mdspan`.
+     *
+     * @details The element count comes from the layout mapping, so the reservation
+     * matches what the mapping will actually index. Construction, counting and
+     * exception behaviour are exactly @ref push_array's.
+     * @tparam T              Element type.
+     * @tparam N              Rank. Deduced from a `std::array` argument; pass it
+     *                        explicitly when using a braced list.
+     * @tparam LayoutPolicy   `std::mdspan` layout mapping.
+     * @tparam AccessorPolicy `std::mdspan` accessor.
+     * @param extents Size of each dimension.
+     * @param args    Constructor arguments applied to every element.
+     */
+    template <typename T, std::size_t N, class LayoutPolicy = std::layout_right,
+              class AccessorPolicy = std::default_accessor<T>, typename... ArgsT>
+    [[nodiscard]] auto push_md_array(const std::array<std::size_t, N>& extents, ArgsT&&... args)
+    {
+        static_assert(N > 0, "engram: an mdspan needs at least one dimension");
+
+        using extents_type = std::dextents<std::size_t, N>;
+        using mdspan_type = std::mdspan<T, extents_type, LayoutPolicy, AccessorPolicy>;
+
+        const typename mdspan_type::mapping_type mapping{ extents_type{ extents } };
+        const auto count = mapping.required_span_size();
+        assert(count > 0 && "engram: mdspan extents must all be non-zero");
+
+        auto storage = push_array<T>(count, std::forward<ArgsT>(args)...);
+        if (storage.empty())
+            return mdspan_type{};
+
+        return mdspan_type{ storage.data(), mapping };
+    }
+
+    /** @brief Destroy and pop an array pushed with @ref push_md_array. */
+    template <typename MdSpanT>
+    void pop_md_array(const MdSpanT& span)
+    {
+        pop_array<typename MdSpanT::element_type>(span.mapping().required_span_size());
+    }
+#endif
 
     /** @brief Copy a string view into the arena (NUL-terminated); returns a view of the copy. */
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
@@ -700,6 +768,11 @@ public:
     memory_source source() const noexcept; ///< @return The arena's @ref memory_source.
     arena_error error() const noexcept;    ///< @return The error recorded during creation.
 
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+    /** @brief Where this arena was created (requires `ENGRAM_ENABLE_SOURCE_INFO`). */
+    const std::source_location& origin() const noexcept;
+#endif
+
     /**
      * @brief Access the arena's underlying storage as a contiguous byte range.
      * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
@@ -721,7 +794,7 @@ public:
      *              default (and with `commit`); pass `no_clear` to skip zeroing.
      * @return A sub-arena bound to `[start, start + size)`.
      */
-    [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0);
+    [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM);
 };
 
 } // namespace engram

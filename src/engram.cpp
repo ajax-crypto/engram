@@ -283,6 +283,10 @@ struct impl_data
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
     std::size_t m_save_stacksz = 0;
 
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+    std::source_location m_origin{};
+#endif
+
 	void* m_extra = nullptr;
     bool m_use_sys_free = false;
     bool m_clear_on_free = true;
@@ -693,7 +697,7 @@ bool prefetch(std::byte* ptr, std::size_t size)
 // ---------------------------------------------------------------------------
 // arena factories.
 // ---------------------------------------------------------------------------
-arena arena::create(memory_source type, std::size_t size, int32_t flags, std::size_t alignment, int fd)
+arena arena::create(memory_source type, std::size_t size, int32_t flags, std::size_t alignment, int fd ENGRAM_SOURCE_DECL)
 {
     if (fd != -1)
         flags |= engram::flags::unified;
@@ -703,6 +707,9 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
     d.m_type = type;
     d.m_size = size;
     d.m_clear_on_free = !(flags & engram::flags::no_clear);
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+    d.m_origin = loc;
+#endif
 
     if ((flags & engram::flags::page_aligned) && (type != memory_source::custom))
     {
@@ -922,10 +929,13 @@ arena arena::create_custom_va(std::size_t size, custom type, int32_t flags, std:
     return result;
 }
 
-arena arena::make_external(std::byte* storage, std::size_t size, int32_t flags)
+arena arena::make_external(std::byte* storage, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
     arena result;
     auto& d = *result.m_impl;
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+    d.m_origin = loc;
+#endif
 
     // Align the adopted base up to the max alignment so bump offsets (multiples
     // of that quantum) yield correctly aligned addresses.
@@ -957,7 +967,7 @@ bool stack_fits(std::size_t size)
     return size < get_total_stack_space();
 }
 
-arena arena::wrap_stack(void* storage, std::size_t size, int32_t flags)
+arena arena::wrap_stack(void* storage, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
     if (!storage)
     {
@@ -965,10 +975,13 @@ arena arena::wrap_stack(void* storage, std::size_t size, int32_t flags)
         auto& d = *result.m_impl;
         d.m_type = memory_source::stack;
         d.m_error = arena_error::stack_overflow;
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+        d.m_origin = loc;
+#endif
         return result;
     }
 
-    auto result = make_external((std::byte*)storage, size, flags);
+    auto result = make_external((std::byte*)storage, size, flags ENGRAM_SOURCE_ARG);
     result.m_impl->m_type = memory_source::stack;
     return result;
 }
@@ -1070,6 +1083,14 @@ std::size_t arena::total() const noexcept { return 0; }
 memory_source arena::source() const noexcept { return m_impl ? m_impl->m_type : memory_source::external; }
 arena_error arena::error() const noexcept { return m_impl ? m_impl->m_error : arena_error::no_error; }
 
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+const std::source_location& arena::origin() const noexcept
+{
+    static const std::source_location unknown{};
+    return m_impl ? m_impl->m_origin : unknown;
+}
+#endif
+
 std::span<std::byte> arena::data() const noexcept
 {
     if (!m_impl || !m_impl->m_ptr)
@@ -1077,11 +1098,11 @@ std::span<std::byte> arena::data() const noexcept
     return { m_impl->m_ptr, m_impl->m_size };
 }
 
-arena arena::partition(std::size_t start, std::size_t size, int32_t flags)
+arena arena::partition(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
     auto& d = *m_impl;
     assert((start + size) <= d.m_size);
-    return make_external(d.m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit);
+    return make_external(d.m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit ENGRAM_SOURCE_ARG);
 }
 
 arena::~arena()
