@@ -1210,6 +1210,36 @@ sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
 | [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same five configurations      |
 | [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
 | [`tests/test_profiles.cpp`](tests/test_profiles.cpp)         | Both layouts with `ENGRAM_DISABLE_SAVE_RESTORE`, and both again with `ENGRAM_MINIMAL` — four targets |
+| [`tests/test_vendor_linux.cpp`](tests/test_vendor_linux.cpp) | Both layouts against the real SDK headers for each Linux backend that could be resolved — compile-only |
+
+#### Vendor conformance (Linux)
+
+The Linux device backends need hardware, a kernel module, or root to run, and their
+driver libraries are not linked, so they cannot be covered by ordinary tests. Instead
+[`tests/test_vendor_linux.cpp`](tests/test_vendor_linux.cpp) is compiled — never
+linked — once per backend as an `OBJECT` library. That still catches the failure mode
+that actually bites: engram's backend code drifting out of sync with a vendor header.
+A mismatch is a build failure, so it shows up in `cmake --build`, not in `ctest`.
+
+Headers already installed win; otherwise the header-only SDKs are fetched:
+
+| Backend  | Source                                             |
+| -------- | -------------------------------------------------- |
+| Vulkan   | system, else `KhronosGroup/Vulkan-Headers`          |
+| WebGPU   | system, else `webgpu-native/webgpu-headers`         |
+| PMDK     | system, else `pmem/pmdk` (headers only)             |
+| RDMA     | system only — `apt install libibverbs-dev`          |
+| dma-buf  | system only — `linux/dma-heap.h` from linux-libc-dev |
+
+Anything that cannot be resolved is skipped with a `STATUS` message rather than
+failing the configure, so the suite still builds on a bare machine. Set
+`ENGRAM_FETCH_VENDOR_HEADERS=OFF` to use only what is installed, and
+`ENGRAM_VULKAN_HEADERS_TAG` / `ENGRAM_WEBGPU_HEADERS_TAG` / `ENGRAM_PMDK_TAG` to move
+off the pinned revisions.
+
+CUDA, ROCm, OpenCL, Level Zero, GPUDirect and DPDK are out of scope: the first five
+need vendor toolkits tied to installed hardware, and DPDK needs a meson build plus
+hugepages and a bound NIC.
 
 The C++23 targets are added only when `check_include_file_cxx` finds `<mdspan>`,
 so a C++20-only toolchain still builds the rest of the suite.
@@ -1276,19 +1306,39 @@ engram.warm_cache(mv, engram.CacheLocality.L1, engram.IO.READ)
 engram.prefetch(buf)
 ```
 
-What's exposed: the `Arena` factories (`create`, `heap`, `adopt`),
-byte allocation (`alloc`, `push_bytes`, `push_str`, `pop_bytes`, `partition`),
-scoped rewind (`save`, `restore`, `save_depth`), introspection
-(`used`, `capacity`, `remaining`, `count`, `total`, `source`, `data`, `is_valid`,
-`empty`), `prefetch` / `warm_cache` / `sync` / `reset` / `unpin`, the `MemorySource`,
-`CacheLocality`, and `ArenaError` enums, and `Flag` / `IO` flag sets.
+What's exposed: the `Arena` factories (`create`, `heap`, `adopt`, plus `named_heap`
+and `heapfile` on Linux), byte allocation (`alloc`, `push_bytes`, `push_str`,
+`pop_bytes`, `pop_str`, `partition`), scoped rewind (`save`, `restore`,
+`save_depth`), introspection (`used`, `capacity`, `remaining`, `count`, `total`,
+`source`, `error`, `data`, `is_valid`, `empty`), `prefetch` / `warm_cache` / `sync` /
+`reset` / `unpin`, the `MemorySource`, `CacheLocality`, and `ArenaError` enums, and
+`Flag` / `IO` flag sets.
+
+Factories never raise on failure, matching the C++ API — check `error` (or
+`is_valid()`) after creating an arena:
+
+```python
+a = engram.Arena.heap(1 << 40)
+if a.error != engram.ArenaError.no_error:
+    ...                                          # ArenaError.alloc_failed
+```
+
+`pop_str` accounts for the trailing NUL that `push_str` wrote, so pass it the
+original string (or its length in bytes) rather than computing the reservation
+yourself.
 
 Stack arenas are **not** exposed: they depend on `alloca` reserving space in the
-caller's C++ stack frame, which has no meaning from Python. Use `Arena.heap` or
+caller's C++ stack frame, which has no meaning from Python.
+`Arena.create(MemorySource.stack, ...)` raises `ValueError`; use `Arena.heap` or
 `Arena.adopt` over a `bytearray` instead.
 
 `count` / `total` reflect the per-allocation counters; build the extension with
 `-DENGRAM_DISABLE_TRACKING=ON` (CMake) to drop them, after which both always read `0`.
+The extension follows the same feature macros as the library:
+`-DENGRAM_DISABLE_SAVE_RESTORE=ON` removes `save` / `restore` / `save_depth`,
+`-DENGRAM_EASY_POP=ON` adds an untyped `pop()` and `push_depth`, and
+`-DENGRAM_ENABLE_SOURCE_INFO=ON` adds `origin` as a `(file, line, function)` tuple —
+though the site it records is inside the bindings, not the calling Python frame.
 
 Device/accelerator backends (CUDA, Vulkan, DirectX 12, …) are **not** exposed to
 Python — they need native device handles; use the C++ API for those. Returned

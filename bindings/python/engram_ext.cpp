@@ -90,11 +90,17 @@ PYBIND11_MODULE(_engram, m)
         .def_static(
             "create",
             [](memory_source type, std::size_t size, int flags, std::size_t alignment) {
+                // create() only builds heap/external/custom arenas; stack storage has to be
+                // reserved in the caller's frame by the ENGRAM_STACK_ARENA macro, which has
+                // no Python equivalent.
+                if (type == memory_source::stack)
+                    throw py::value_error("stack arenas cannot be created from Python; "
+                                          "use Arena.heap() or Arena.adopt()");
                 return arena::create(type, size, flags, alignment);
             },
             py::arg("type"), py::arg("size"), py::arg("flags") = 0,
             py::arg("alignment") = alignof(std::max_align_t),
-            "Create an arena for the given memory_source.")
+            "Create an arena for the given memory_source (stack is not supported).")
         .def_static(
             "heap",
             [](std::size_t size, bool true_contiguous, std::size_t alignment) {
@@ -102,6 +108,25 @@ PYBIND11_MODULE(_engram, m)
             },
             py::arg("size"), py::arg("true_contiguous") = false,
             py::arg("alignment") = alignof(std::max_align_t), "Heap arena.")
+#ifdef __linux__
+        .def_static(
+            "named_heap",
+            [](std::size_t size, const std::string& name, bool true_contiguous,
+               std::size_t alignment) {
+                return arena::heap(size, std::string_view{name}, true_contiguous, alignment);
+            },
+            py::arg("size"), py::arg("name"), py::arg("true_contiguous") = false,
+            py::arg("alignment") = alignof(std::max_align_t),
+            "Heap arena whose mapping is named in /proc/<pid>/maps (Linux only).")
+        .def_static(
+            "heapfile",
+            [](std::size_t size, const std::string& name, std::size_t alignment) {
+                return arena::heapfile(size, std::string_view{name}, alignment);
+            },
+            py::arg("size"), py::arg("name"),
+            py::arg("alignment") = alignof(std::max_align_t),
+            "Heap arena backed by an anonymous memfd (Linux only).")
+#endif
         .def_static(
             "adopt",
             [](py::buffer buffer, int flags) {
@@ -144,6 +169,18 @@ PYBIND11_MODULE(_engram, m)
             "pop_bytes", [](arena& a, std::size_t nbytes) { a.pop_array<std::byte>(nbytes); },
             py::arg("nbytes"), "Release the last nbytes pushed (LIFO).")
         .def(
+            "pop_str",
+            [](arena& a, const py::object& text) {
+                // push_str also stored a NUL, so the reservation is one byte longer than
+                // the string itself.
+                auto length = py::isinstance<py::str>(text) ? text.cast<std::string>().size()
+                                                            : text.cast<std::size_t>();
+                a.pop_array<std::byte>(length + 1);
+            },
+            py::arg("text"),
+            "Release a string pushed with push_str. Pass the original str, or its length "
+            "in bytes; the trailing NUL is accounted for automatically.")
+        .def(
             "partition",
             [](arena& a, std::size_t start, std::size_t size, int flags) {
                 return a.partition(start, size, flags);
@@ -172,6 +209,7 @@ PYBIND11_MODULE(_engram, m)
              "Synchronize a device-backed arena (no-op for host arenas).")
         .def("reset", &arena::reset,
              "Reclaim all storage in O(1), resetting the arena to empty (runs no destructors).")
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
         .def("save", &arena::save,
              "Record the current head so a later restore() rewinds to it. Save points nest "
              "LIFO; returns False if the save stack (ENGRAM_MAX_SAVE_STACKSZ) is full.")
@@ -180,6 +218,14 @@ PYBIND11_MODULE(_engram, m)
              "Returns False if no save point is pending.")
         .def_property_readonly("save_depth", &arena::save_depth,
                                "Number of save points currently pending.")
+#endif
+#ifdef ENGRAM_EASY_POP
+        .def("pop", [](arena& a) { a.pop(); },
+             "Release the most recent push, whatever it was. Runs no destructors and "
+             "zeroes the reclaimed bytes unless the arena was created with flags.no_clear.")
+        .def_property_readonly("push_depth", &arena::push_depth,
+                               "Number of pushes pop() can still rewind through.")
+#endif
         .def("unpin", &arena::unpin, "Release pages pinned via flags::pin_to_physical.")
 
         // ---- introspection -------------------------------------------------
@@ -193,6 +239,19 @@ PYBIND11_MODULE(_engram, m)
         .def_property_readonly("total", &arena::total,
                                "Lifetime allocation count (0 if built with ENGRAM_DISABLE_TRACKING).")
         .def_property_readonly("source", &arena::source)
+        .def_property_readonly("error", &arena::error,
+                               "The ArenaError recorded when the arena was created. Creation "
+                               "never raises, so check this (or is_valid()) after a factory call.")
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+        .def_property_readonly(
+            "origin",
+            [](arena& a) {
+                const auto& loc = a.origin();
+                return py::make_tuple(loc.file_name(), loc.line(), loc.function_name());
+            },
+            "Where this arena was created, as (file, line, function). Requires a build with "
+            "ENGRAM_ENABLE_SOURCE_INFO; the site recorded is inside the bindings.")
+#endif
         .def(
             "data",
             [](arena& a) -> py::object {

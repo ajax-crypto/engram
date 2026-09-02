@@ -166,3 +166,148 @@ if(ENGRAM_HAVE_MDSPAN)
 else()
     message(STATUS "engram: <mdspan> not available; skipping the push_md_array tests")
 endif()
+
+# ---------------------------------------------------------------------------
+# Linux vendor backends: compile-only conformance against the real SDK headers.
+#
+# These backends need hardware, a kernel module, or root to run, and their driver
+# libraries are not linked here. What is under test is that engram's backend code
+# still type-checks against the vendor headers, so each target is an OBJECT library
+# and a mismatch shows up as a build failure.
+#
+# Headers already on the system win; otherwise the header-only SDKs are fetched.
+# Anything that cannot be resolved is skipped with a message rather than failing.
+# ---------------------------------------------------------------------------
+if(UNIX AND NOT APPLE)
+    option(ENGRAM_FETCH_VENDOR_HEADERS
+        "Download the header-only vendor SDKs the Linux conformance targets need." ON)
+
+    # Pinned so a fetch is reproducible; override if a tag moves or is unavailable.
+    set(ENGRAM_VULKAN_HEADERS_TAG "vulkan-sdk-1.3.290.0" CACHE STRING "Vulkan-Headers git tag.")
+    set(ENGRAM_WEBGPU_HEADERS_TAG "main"                 CACHE STRING "webgpu-headers git tag.")
+    set(ENGRAM_PMDK_TAG           "1.13.1"               CACHE STRING "PMDK git tag.")
+
+    include(FetchContent)
+
+    set(ENGRAM_VENDOR_BACKENDS "")
+    set(ENGRAM_VENDOR_SKIPPED "")
+
+    # Populate without configuring: pointing SOURCE_SUBDIR at a directory that does
+    # not exist stops MakeAvailable from calling add_subdirectory, which is what we
+    # want for header-only SDKs (and FetchContent_Populate is deprecated).
+    function(engram_fetch_headers_only name repo tag out_dir)
+        FetchContent_Declare(${name}
+            GIT_REPOSITORY ${repo}
+            GIT_TAG        ${tag}
+            GIT_SHALLOW    TRUE
+            SOURCE_SUBDIR  engram-no-configure)
+        FetchContent_MakeAvailable(${name})
+        set(${out_dir} ${${name}_SOURCE_DIR} PARENT_SCOPE)
+    endfunction()
+
+    # --- Vulkan: header-only upstream, so a fetch is reliable -----------------
+    find_path(ENGRAM_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+    if(ENGRAM_VULKAN_INCLUDE_DIR)
+        set(ENGRAM_VENDOR_VULKAN_INCLUDES ${ENGRAM_VULKAN_INCLUDE_DIR})
+        list(APPEND ENGRAM_VENDOR_BACKENDS VULKAN)
+    elseif(ENGRAM_FETCH_VENDOR_HEADERS)
+        engram_fetch_headers_only(vulkan_headers
+            https://github.com/KhronosGroup/Vulkan-Headers.git
+            ${ENGRAM_VULKAN_HEADERS_TAG} vulkan_src)
+        set(ENGRAM_VENDOR_VULKAN_INCLUDES ${vulkan_src}/include)
+        list(APPEND ENGRAM_VENDOR_BACKENDS VULKAN)
+    else()
+        list(APPEND ENGRAM_VENDOR_SKIPPED "Vulkan")
+    endif()
+
+    # --- WebGPU: upstream ships webgpu.h at the repo root while engram includes
+    #     <webgpu/webgpu.h>, so stage it into the expected layout --------------
+    find_path(ENGRAM_WEBGPU_INCLUDE_DIR webgpu/webgpu.h)
+    if(ENGRAM_WEBGPU_INCLUDE_DIR)
+        set(ENGRAM_VENDOR_WEBGPU_INCLUDES ${ENGRAM_WEBGPU_INCLUDE_DIR})
+        list(APPEND ENGRAM_VENDOR_BACKENDS WEBGPU)
+    elseif(ENGRAM_FETCH_VENDOR_HEADERS)
+        engram_fetch_headers_only(webgpu_headers
+            https://github.com/webgpu-native/webgpu-headers.git
+            ${ENGRAM_WEBGPU_HEADERS_TAG} webgpu_src)
+        file(COPY ${webgpu_src}/webgpu.h
+             DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/vendor_include/webgpu)
+        set(ENGRAM_VENDOR_WEBGPU_INCLUDES ${CMAKE_CURRENT_BINARY_DIR}/vendor_include)
+        list(APPEND ENGRAM_VENDOR_BACKENDS WEBGPU)
+    else()
+        list(APPEND ENGRAM_VENDOR_SKIPPED "WebGPU")
+    endif()
+
+    # --- PMDK: libpmem.h is self-contained in the source tree ----------------
+    find_path(ENGRAM_PMDK_INCLUDE_DIR libpmem.h)
+    if(ENGRAM_PMDK_INCLUDE_DIR)
+        set(ENGRAM_VENDOR_PMDK_INCLUDES ${ENGRAM_PMDK_INCLUDE_DIR})
+        list(APPEND ENGRAM_VENDOR_BACKENDS PMDK)
+    elseif(ENGRAM_FETCH_VENDOR_HEADERS)
+        engram_fetch_headers_only(pmdk
+            https://github.com/pmem/pmdk.git
+            ${ENGRAM_PMDK_TAG} pmdk_src)
+        set(ENGRAM_VENDOR_PMDK_INCLUDES ${pmdk_src}/src/include)
+        list(APPEND ENGRAM_VENDOR_BACKENDS PMDK)
+    else()
+        list(APPEND ENGRAM_VENDOR_SKIPPED "PMDK")
+    endif()
+
+    # --- RDMA: rdma-core generates part of infiniband/verbs_api.h at build time,
+    #     so rebuilding the include tree from a bare checkout is fragile. Take the
+    #     distro package when it is present -----------------------------------
+    find_path(ENGRAM_RDMA_INCLUDE_DIR infiniband/verbs.h)
+    if(ENGRAM_RDMA_INCLUDE_DIR)
+        set(ENGRAM_VENDOR_RDMA_INCLUDES ${ENGRAM_RDMA_INCLUDE_DIR})
+        list(APPEND ENGRAM_VENDOR_BACKENDS RDMA)
+    else()
+        list(APPEND ENGRAM_VENDOR_SKIPPED "RDMA (apt install libibverbs-dev)")
+    endif()
+
+    # --- dma-buf: a kernel UAPI header, so it comes from linux-libc-dev ------
+    find_path(ENGRAM_DMABUF_INCLUDE_DIR linux/dma-heap.h)
+    if(ENGRAM_DMABUF_INCLUDE_DIR)
+        set(ENGRAM_VENDOR_DMABUF_INCLUDES ${ENGRAM_DMABUF_INCLUDE_DIR})
+        list(APPEND ENGRAM_VENDOR_BACKENDS DMABUF)
+    else()
+        list(APPEND ENGRAM_VENDOR_SKIPPED "dma-buf (needs linux/dma-heap.h)")
+    endif()
+
+    # Compiled, never linked: the driver symbols stay deliberately unresolved.
+    function(engram_add_vendor_conformance name)
+        cmake_parse_arguments(ARG "" "" "SOURCES;INCLUDES;DEFINES" ${ARGN})
+
+        add_library(${name} OBJECT ${ARG_SOURCES})
+        target_include_directories(${name} PRIVATE ${ARG_INCLUDES})
+        target_compile_definitions(${name} PRIVATE ${ARG_DEFINES})
+        target_compile_features(${name} PRIVATE cxx_std_20)
+        target_compile_options(${name} PRIVATE -Wall -Wextra)
+    endfunction()
+
+    foreach(backend IN LISTS ENGRAM_VENDOR_BACKENDS)
+        string(TOLOWER ${backend} lower)
+
+        engram_add_vendor_conformance(engram_vendor_single_h_${lower}
+            SOURCES  test_vendor_linux.cpp
+            INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+                     ${ENGRAM_VENDOR_${backend}_INCLUDES}
+            DEFINES  ENGRAM_ENABLE_${backend} ENGRAM_SINGLE_HEADER_BUILD)
+
+        # The split build keeps its vendor code in engram.cpp, so compile that
+        # against the same headers rather than only the calling side.
+        engram_add_vendor_conformance(engram_vendor_hcpp_${lower}
+            SOURCES  test_vendor_linux.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+            INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+                     ${ENGRAM_VENDOR_${backend}_INCLUDES}
+            DEFINES  ENGRAM_ENABLE_${backend})
+    endforeach()
+
+    if(ENGRAM_VENDOR_BACKENDS)
+        string(REPLACE ";" ", " ENGRAM_VENDOR_LIST "${ENGRAM_VENDOR_BACKENDS}")
+        message(STATUS "engram: vendor conformance (compile-only) for ${ENGRAM_VENDOR_LIST}")
+    endif()
+    if(ENGRAM_VENDOR_SKIPPED)
+        string(REPLACE ";" ", " ENGRAM_VENDOR_SKIP_LIST "${ENGRAM_VENDOR_SKIPPED}")
+        message(STATUS "engram: vendor conformance skipped for ${ENGRAM_VENDOR_SKIP_LIST}")
+    endif()
+endif()

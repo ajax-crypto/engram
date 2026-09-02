@@ -19,6 +19,25 @@ if(ENGRAM_DISABLE_TRACKING)
     target_compile_definitions(_engram PRIVATE ENGRAM_DISABLE_TRACKING)
 endif()
 
+# Optional: drop save/restore. Arena.save / restore / save_depth disappear with it.
+option(ENGRAM_DISABLE_SAVE_RESTORE "Drop save/restore and the save-point stack." OFF)
+if(ENGRAM_DISABLE_SAVE_RESTORE)
+    target_compile_definitions(_engram PRIVATE ENGRAM_DISABLE_SAVE_RESTORE)
+endif()
+
+# Optional: add the untyped Arena.pop() and Arena.push_depth.
+option(ENGRAM_EASY_POP "Record every push so an untyped pop() can rewind it." OFF)
+if(ENGRAM_EASY_POP)
+    target_compile_definitions(_engram PRIVATE ENGRAM_EASY_POP)
+endif()
+
+# Optional: record where each arena was created, exposed as Arena.origin. The site
+# recorded is inside the bindings, not the calling Python frame.
+option(ENGRAM_ENABLE_SOURCE_INFO "Record the creation site of every arena." OFF)
+if(ENGRAM_ENABLE_SOURCE_INFO)
+    target_compile_definitions(_engram PRIVATE ENGRAM_ENABLE_SOURCE_INFO)
+endif()
+
 # The single header auto-enables the platform's default device backend
 # (DirectX 12 on Windows, Metal on Apple); link the corresponding system
 # libraries. No third-party SDK is required.
