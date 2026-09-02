@@ -660,6 +660,14 @@ template <typename T, typename Extents, typename LayoutPolicy, typename Accessor
 inline constexpr bool is_mdspan_v<std::mdspan<T, Extents, LayoutPolicy, AccessorPolicy>> = true;
 #endif
 
+// Binary fold, so the trailing pad ENGRAM_STACK_ARENA appends is enough to keep an
+// empty flag list well-formed.
+template <typename... FlagsT>
+constexpr int32_t combine_flags(FlagsT... values)
+{
+    return (int32_t{ engram::flags::none } | ... | static_cast<int32_t>(values));
+}
+
 } // namespace detail
 
 /**
@@ -3225,13 +3233,15 @@ inline void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
 } // namespace engram
 
 #define ENGRAM_STACK_ARENA_EXPAND_(x) x
-#define ENGRAM_STACK_ARENA_IMPL_(varname, size, flags, ...)                        \
-    const std::size_t varname##_engram_size_ = (std::size_t)(size);               \
+#define ENGRAM_STACK_ARENA_IMPL_(varname, size, ...)                               \
+    const std::size_t varname##_engram_size_ = (std::size_t)(size);                \
     void* varname##_engram_storage_ = engram::stack_fits(varname##_engram_size_)   \
         ? ENGRAM_STACK_ALLOC(varname##_engram_size_)                               \
         : nullptr;                                                                 \
-    engram::arena varname = engram::arena::wrap_stack(                             \
-        varname##_engram_storage_, varname##_engram_size_, (flags))
+    engram::arena varname##_engram_arena_ = engram::arena::wrap_stack(             \
+        varname##_engram_storage_, varname##_engram_size_,                         \
+        engram::detail::combine_flags(__VA_ARGS__));                               \
+    engram::arena& varname = varname##_engram_arena_
 
 /**
  * @brief Declare a stack-backed arena named @p varname in the current scope.
@@ -3241,16 +3251,24 @@ inline void allocate_dmabuf(arena& arena, int deviceFd, int32_t flags)
  * arena is therefore usable only within the enclosing scope, and its storage is gone
  * once that scope exits.
  *
- * Usage: `ENGRAM_STACK_ARENA(scratch, 4096)` or
- * `ENGRAM_STACK_ARENA(scratch, 4096, engram::flags::commit)`.
+ * Everything after the size is treated as @ref engram::flags and OR-ed together, so
+ * `ENGRAM_STACK_ARENA(scratch, 4096)`,
+ * `ENGRAM_STACK_ARENA(scratch, 4096, engram::flags::commit)` and
+ * `ENGRAM_STACK_ARENA(scratch, 4096, engram::flags::commit, engram::flags::no_clear)`
+ * are all valid.
+ *
+ * @p varname names an `arena&` bound to a hidden local, not an arena object, so
+ * `return scratch;` and passing it by value do not compile: implicit move does not
+ * apply to references, which leaves only the deleted copy constructor. Escaping the
+ * frame therefore takes a deliberate `std::move`, which is on you.
  *
  * The request is checked against the thread's stack size first; if it does not fit,
  * @p varname is an invalid arena reporting @ref engram::arena_error::stack_overflow
- * rather than a smashed stack. Two extra names (`<varname>_engram_size_` and
- * `<varname>_engram_storage_`) are declared alongside it, so the macro needs a block
- * scope rather than a bare `if` branch.
+ * rather than a smashed stack. Three extra names (`<varname>_engram_size_`,
+ * `<varname>_engram_storage_` and `<varname>_engram_arena_`) are declared alongside
+ * it, so the macro needs a block scope rather than a bare `if` branch.
  */
 #define ENGRAM_STACK_ARENA(varname, ...) \
-    ENGRAM_STACK_ARENA_EXPAND_(ENGRAM_STACK_ARENA_IMPL_(varname, __VA_ARGS__, engram::flags::none, 0))
+    ENGRAM_STACK_ARENA_EXPAND_(ENGRAM_STACK_ARENA_IMPL_(varname, __VA_ARGS__, engram::flags::none))
 
 #endif // ENGRAM_H_INCLUDED

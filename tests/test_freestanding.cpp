@@ -172,6 +172,31 @@ TEST(FreestandingCreation, OversizedStackArenaMacroReportsOverflow)
     LONGS_EQUAL((long)arena_error::stack_overflow, (long)a.error());
 }
 
+TEST(FreestandingCreation, StackArenaCannotEscapeItsFrame)
+{
+    ENGRAM_STACK_ARENA(a, 256);
+
+    // A reference, so `return a;` picks the deleted copy constructor rather than
+    // silently moving storage that dies with the frame.
+    static_assert(std::is_reference_v<decltype(a)>,
+        "ENGRAM_STACK_ARENA must bind a reference");
+    static_assert(!std::is_constructible_v<arena, decltype(a)>,
+        "a stack arena must not be returnable or copyable by value");
+
+    CHECK_TRUE(a.is_valid());
+}
+
+TEST(FreestandingCreation, StackArenaMacroOrsEveryFlagArgument)
+{
+    static_assert(engram::detail::combine_flags(flags::commit, flags::no_clear)
+        == (flags::commit | flags::no_clear));
+
+    ENGRAM_STACK_ARENA(a, 512, flags::no_clear, flags::commit);
+
+    CHECK_TRUE(a.is_valid());
+    CHECK_TRUE(all_equal(a.data().data(), a.data().size(), 0x00));
+}
+
 // ---------------------------------------------------------------------------
 // Flags that still mean something without an OS
 // ---------------------------------------------------------------------------

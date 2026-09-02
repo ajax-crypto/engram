@@ -177,6 +177,14 @@ void render()
 ENGRAM_STACK_ARENA(zeroed, 4096, engram::flags::commit);          // optional flags
 ```
 
+Everything after the size is taken as flags and OR-ed together, so you can pass
+them as one expression or as separate arguments — whichever reads better:
+
+```cpp
+ENGRAM_STACK_ARENA(a, 4096, engram::flags::commit | engram::flags::no_clear);
+ENGRAM_STACK_ARENA(b, 4096, engram::flags::commit, engram::flags::no_clear);   // same thing
+```
+
 The request is checked against the thread's stack size before anything is
 reserved. If it does not fit you get an invalid arena reporting
 `arena_error::stack_overflow`, not a smashed stack:
@@ -186,13 +194,29 @@ ENGRAM_STACK_ARENA(huge, 1ull << 40);
 assert(!huge.is_valid() && huge.error() == arena_error::stack_overflow);
 ```
 
-Two helper names (`<varname>_engram_size_` and `<varname>_engram_storage_`) are
-declared next to the arena, so the macro needs a block scope — give a bare `if`
-branch braces before using it. There is no heap fallback: use `arena::heap` if the
-size is not known to be small.
+Three helper names (`<varname>_engram_size_`, `<varname>_engram_storage_` and
+`<varname>_engram_arena_`) are declared next to the arena, so the macro needs a
+block scope — give a bare `if` branch braces before using it. There is no heap
+fallback: use `arena::heap` if the size is not known to be small.
 
-> The arena and its storage die with the enclosing scope. Do not return it, move
-> it out, or store a `partition` of it beyond that scope.
+The arena and its storage die with the enclosing scope, so unlike every other
+arena a stack arena must not be moved out of its frame. The macro enforces this at
+compile time: `<varname>` names an `arena&` bound to a hidden local, not an arena
+object, and implicit move does not apply to references — so returning it selects
+the deleted copy constructor and the build fails:
+
+```cpp
+engram::arena make_scratch()
+{
+    ENGRAM_STACK_ARENA(scratch, 4096);
+    return scratch;                     // error: arena(const arena&) is deleted
+}
+```
+
+The same applies to passing it to a by-value parameter. Only an explicit
+`std::move(scratch)` still compiles — that is a deliberate act, and it dangles.
+Partitions of a stack arena are ordinary arenas and *are* movable, so they carry
+no such guard; do not let one outlive the frame either.
 
 ### Flags
 
