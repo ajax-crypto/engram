@@ -570,8 +570,20 @@ TEST(FreestandingExtra, WarmCacheIsAvailableAndHarmless)
     a.warm_cache(engram::cache_locality::Discard, flags::write);
     a.warm_cache(span.data(), engram::cache_locality::L2, flags::read);
     engram::warm_cache(g_pool, engram::cache_locality::L3, flags::read);
+    engram::warm_cache(g_pool, sizeof(g_pool), engram::cache_locality::L3, flags::read);
 
     CHECK_TRUE(all_equal(span.data(), span.size(), 0x33));
+}
+
+TEST(FreestandingExtra, WarmCacheToleratesEdgeRanges)
+{
+    auto a = arena::adopt(g_pool, sizeof(g_pool), flags::commit);
+
+    engram::warm_cache(static_cast<std::byte*>(nullptr), 4096, engram::cache_locality::L1, flags::read);
+    engram::warm_cache(g_pool, 0, engram::cache_locality::L1, flags::read);
+    a.warm_cache(engram::cache_locality::L1, flags::read, sizeof(g_pool), 0);
+
+    CHECK_TRUE(a.is_valid());
 }
 
 #endif

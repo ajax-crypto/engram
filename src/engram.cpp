@@ -275,6 +275,7 @@ struct impl_data
     std::size_t m_push_depth = 0;
 #endif
 
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
     // One entry per pending arena::save(); restore() rewinds to the newest one.
     struct save_point
     {
@@ -288,6 +289,7 @@ struct impl_data
     };
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
     std::size_t m_save_stacksz = 0;
+#endif
 
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
     std::source_location m_origin{};
@@ -666,7 +668,7 @@ void warm_cache(std::byte* ptr, std::size_t size, cache_locality locality, int32
     if (size == 0)
         size = 1;
 
-    for (std::size_t off = 0; off < size; off += 64)
+    for (std::size_t off = 0; off < size; off += ENGRAM_CACHELINE_SZ)
         PrefetchIntoCache((const void*)(ptr + off), rw, loc);
 }
 
@@ -1179,12 +1181,15 @@ void arena::reset() noexcept
 #ifdef ENGRAM_EASY_POP
     d.m_push_depth = 0;
 #endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
     d.m_save_stacksz = 0;
+#endif
 #ifndef ENGRAM_DISABLE_PMR
     d.m_pmr.reset();
 #endif
 }
 
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
 bool arena::save() noexcept
 {
     auto& d = *m_impl;
@@ -1224,6 +1229,7 @@ bool arena::restore() noexcept
 }
 
 std::size_t arena::save_depth() const noexcept { return m_impl->m_save_stacksz; }
+#endif
 
 void arena::unpin()
 {
@@ -1439,9 +1445,7 @@ void arena::warm_cache(cache_locality locality, int32_t ioflags, std::size_t sta
         size = (size == 0) ? d.m_size - start : size;
         assert(start + size <= d.m_size);
 
-        for (auto idx = start; idx < start + size; idx++)
-            PrefetchIntoCache(d.m_ptr + idx, (ioflags & flags::write) ? 1 : 0, 
-                static_cast<int>(locality));
+        engram::warm_cache(d.m_ptr + start, size, locality, ioflags);
     }
 }
 

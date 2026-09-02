@@ -54,6 +54,49 @@
 #endif
 #endif
 
+#ifdef ENGRAM_MINIMAL
+// Freestanding's trimming, but the heap and the OS stay: every optional book-keeping
+// feature is off and only the platform's native GPU backend survives.
+#undef ENGRAM_ALL
+#undef ENGRAM_ENABLE_CUDA
+#undef ENGRAM_ENABLE_ROCM
+#undef ENGRAM_ENABLE_OPENCL
+#undef ENGRAM_ENABLE_SYCL
+#undef ENGRAM_ENABLE_LEVEL_ZERO
+#undef ENGRAM_ENABLE_WEBGPU
+#undef ENGRAM_ENABLE_XDNA
+#undef ENGRAM_ENABLE_DPDK
+#undef ENGRAM_ENABLE_OP_TEE
+#undef ENGRAM_ENABLE_PMDK
+#undef ENGRAM_ENABLE_RDMA
+#undef ENGRAM_ENABLE_GPUDIRECT
+#undef ENGRAM_ENABLE_DMABUF
+#undef ENGRAM_EASY_POP
+
+// DX12 (Windows) and Metal (Apple) are switched on by the platform block below;
+// Vulkan is the Linux equivalent and has to be asked for.
+#ifdef __linux__
+#ifndef ENGRAM_ENABLE_VULKAN
+#define ENGRAM_ENABLE_VULKAN
+#endif
+#else
+#undef ENGRAM_ENABLE_VULKAN
+#endif
+
+#ifndef ENGRAM_DISABLE_PMR
+#define ENGRAM_DISABLE_PMR
+#endif
+#ifndef ENGRAM_DISABLE_TRACKING
+#define ENGRAM_DISABLE_TRACKING
+#endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
+#define ENGRAM_DISABLE_SAVE_RESTORE
+#endif
+#ifndef ENGRAM_MASK_EXCEPTIONS
+#define ENGRAM_MASK_EXCEPTIONS
+#endif
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <tuple>
@@ -69,6 +112,16 @@
 
 #ifndef ENGRAM_FALLBACK_PAGESZ
 #define ENGRAM_FALLBACK_PAGESZ 4096
+#endif
+
+/** @brief Bytes covered by one prefetch instruction. */
+#ifndef ENGRAM_CACHELINE_SZ
+#define ENGRAM_CACHELINE_SZ 64
+#endif
+
+/** @brief Taken when an unrecoverable misuse is detected; must not return. */
+#ifndef ENGRAM_ABORT
+#define ENGRAM_ABORT() abort()
 #endif
 
 #ifndef ENGRAM_DISABLE_PMR
@@ -109,7 +162,7 @@
 #endif
 
 /** @brief Depth of the fixed save-point stack used by @ref engram::arena::save. */
-#ifndef ENGRAM_MAX_SAVE_STACKSZ
+#if !defined(ENGRAM_DISABLE_SAVE_RESTORE) && !defined(ENGRAM_MAX_SAVE_STACKSZ)
 #define ENGRAM_MAX_SAVE_STACKSZ 32
 #endif
 
@@ -590,6 +643,27 @@ inline bool stack_fits(std::size_t size)
 
 #if !defined(ENGRAM_ENABLE_FREESTANDING) || defined(ENGRAM_ENABLE_FSEXTRA)
 /**
+ * @brief Emit CPU prefetch hints for a host memory range.
+ * @param ptr      Start of the range.
+ * @param size     Number of bytes to warm.
+ * @param locality Target cache level.
+ * @param ioflags  `flags::read` or `flags::write` access-intent hint.
+ */
+inline void warm_cache(std::byte* ptr, std::size_t size, cache_locality locality, int32_t ioflags)
+{
+    if (!ptr)
+        return;
+
+    auto rw = (ioflags & flags::write) ? 1 : 0;
+    auto loc = static_cast<int>(locality);
+    if (size == 0)
+        size = 1;
+
+    for (std::size_t off = 0; off < size; off += ENGRAM_CACHELINE_SZ)
+        PrefetchIntoCache((const void*)(ptr + off), rw, loc);
+}
+
+/**
  * @brief Emit CPU prefetch hints for `sizeof(T)`-aligned data at @p ptr.
  * @tparam T       Pointee type.
  * @param ptr      Address to warm.
@@ -599,20 +673,18 @@ inline bool stack_fits(std::size_t size)
 template <typename T>
 void warm_cache(T* ptr, cache_locality locality, int32_t ioflags)
 {
-    PrefetchIntoCache(ptr, (ioflags & flags::write) ? 1 : 0, static_cast<int>(locality));
+    warm_cache((std::byte*)ptr, sizeof(T), locality, ioflags);
 }
 #endif
 
 #ifndef ENGRAM_ENABLE_FREESTANDING
 /**
  * @brief Page a host range into RAM (`madvise(MADV_WILLNEED)` / `PrefetchVirtualMemory`).
- * @tparam T   Pointee type.
  * @param ptr  Start of the range.
- * @param size Number of elements.
+ * @param size Number of bytes.
  * @return `true` if the OS accepted the prefetch request.
  */
-template <typename T>
-bool prefetch(T* ptr, std::size_t size)
+inline bool prefetch(std::byte* ptr, std::size_t size)
 {
     auto ok = false;
     
@@ -623,7 +695,7 @@ bool prefetch(T* ptr, std::size_t size)
             ok = madvise(ptr, size, MADV_WILLNEED) == 0;
 #else
             auto pagesz = get_page_size();
-            for (volatile auto* p = ptr; p < ptr + size; p += pagesz)
+            for (volatile std::byte* p = ptr; p < ptr + size; p += pagesz)
             {
                 auto junk = *p;
                 (void)junk;
@@ -640,6 +712,19 @@ bool prefetch(T* ptr, std::size_t size)
     }
 
     return ok;
+}
+
+/**
+ * @brief Typed overload of @ref prefetch; pages in `size * sizeof(T)` bytes at @p ptr.
+ * @tparam T   Pointee type.
+ * @param ptr  Start of the range.
+ * @param size Number of elements.
+ * @return `true` if the OS accepted the prefetch request.
+ */
+template <typename T>
+bool prefetch(T* ptr, std::size_t size)
+{
+    return prefetch((std::byte*)ptr, size * sizeof(T));
 }
 #endif
 
@@ -831,6 +916,7 @@ public:
     std::size_t m_push_depth = 0;
 #endif
 
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
     // One entry per pending save(); restore() rewinds to the newest one.
     struct save_point
     {
@@ -844,6 +930,7 @@ public:
     };
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
     std::size_t m_save_stacksz = 0;
+#endif
 
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
     std::source_location m_origin{};
@@ -1415,8 +1502,10 @@ public:
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
         m_origin = other.m_origin;
 #endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
         m_save_stack = other.m_save_stack;
         m_save_stacksz = other.m_save_stacksz;
+#endif
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
         other.m_pmr.reset();
@@ -1448,8 +1537,10 @@ public:
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
         m_origin = other.m_origin;
 #endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
         m_save_stack = other.m_save_stack;
         m_save_stacksz = other.m_save_stacksz;
+#endif
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
         other.m_pmr.reset();
@@ -1513,12 +1604,20 @@ public:
 	 * @brief Construct a `T` in the arena and return a reference to it.
 	 * @tparam T     Type to construct; if `T` is `arena`, a nested arena is created via @ref create.
 	 * @tparam ArgsT Constructor (or @ref create) argument types.
+	 * @details A `T&` cannot report exhaustion, so running out of room aborts rather than
+	 * returning a null reference. Check @ref remaining first, or use @ref push_array /
+	 * @ref push_string, which report failure through an empty result and @ref error.
 	 */
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
 		auto slot = reserve(sizeof(T), true);
-        assert(slot && "engram: push() on an exhausted arena");
+        if (!slot)
+        {
+            assert(false && "engram: push() on an exhausted arena");
+            ENGRAM_ABORT();
+        }
+
         if constexpr (!std::is_same_v<T, arena>)
         {
 #if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
@@ -1795,12 +1894,15 @@ public:
 #ifdef ENGRAM_EASY_POP
         m_push_depth = 0;
 #endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
         m_save_stacksz = 0;
+#endif
 #ifndef ENGRAM_DISABLE_PMR
         m_pmr.reset();
 #endif
     }
 
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
     /**
      * @brief Push the current head onto the save stack (an implicit sub-arena marker).
      * @details Save points nest LIFO and are held in a fixed array of
@@ -1854,6 +1956,7 @@ public:
 
     /** @return Number of save points currently pending. */
     std::size_t save_depth() const noexcept { return m_save_stacksz; }
+#endif
 
 #ifndef ENGRAM_ENABLE_FREESTANDING
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
@@ -2106,9 +2209,7 @@ public:
             size = (size == 0) ? m_size - start : size;
             assert(start + size <= m_size);
 
-            for (auto idx = start; idx < start + size; idx++)
-                PrefetchIntoCache(m_ptr + idx, (ioflags & flags::write) ? 1 : 0, 
-                    static_cast<int>(locality));
+            engram::warm_cache(m_ptr + start, size, locality, ioflags);
         }
     }
 
@@ -2119,7 +2220,7 @@ public:
         if (m_ptr && (m_type != memory_source::custom))
         {
             assert((std::byte*)ptr >= m_ptr && (std::byte*)ptr < m_ptr + m_size);
-            PrefetchIntoCache(ptr, (ioflags & flags::write) ? 1 : 0, static_cast<int>(locality));
+            engram::warm_cache((std::byte*)ptr, sizeof(T), locality, ioflags);
         }
     }
 #endif

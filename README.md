@@ -443,6 +443,21 @@ The stack depth defaults to 32 entries; define `ENGRAM_MAX_SAVE_STACKSZ` before
 including the header to change it (and compile `engram.cpp` with the same value
 in the split build).
 
+That fixed array is the single biggest contributor to `sizeof(arena)`. If you never
+use scoped rewind, define `ENGRAM_DISABLE_SAVE_RESTORE` to compile the whole feature
+out — `save`, `restore`, `save_depth` and the stack itself all disappear, and calls to
+them stop compiling rather than silently doing nothing. Measured on MSVC x64:
+
+| Build                            | `sizeof(engram::arena)` |
+| -------------------------------- | ----------------------- |
+| Default                          | 648 bytes               |
+| `ENGRAM_DISABLE_SAVE_RESTORE`    | 128 bytes               |
+| `ENGRAM_MINIMAL`                 | 56 bytes                |
+| Default + `ENGRAM_EASY_POP`      | 1424 bytes              |
+
+`reset()` still rewinds the arena, so it remains the way to reclaim everything at
+once. See [Build profiles](#build-profiles) for the bundled `ENGRAM_MINIMAL` preset.
+
 > `restore()` runs **no destructors** — it is a raw rewind, like `reset()`. Pop
 > anything that needs cleanup before restoring. The reclaimed bytes are zeroed
 > unless the arena was created with `flags::no_clear`; device
@@ -540,18 +555,30 @@ namespace that operate on *any* pointer — a plain heap allocation, an arena's
 storage, or memory you got elsewhere:
 
 ```cpp
-// Emit a CPU prefetch hint for the cache line(s) at ptr.
+// Emit CPU prefetch hints covering the sizeof(T) bytes at ptr.
 template <typename T>
 void engram::warm_cache(T* ptr, cache_locality locality, int32_t ioflags);
 
-// Fault a [ptr, ptr + size) range into RAM / the page cache. Returns true on success.
+// The same over an explicit byte range.
+void engram::warm_cache(std::byte* ptr, std::size_t size, cache_locality locality, int32_t ioflags);
+
+// Fault size elements into RAM / the page cache. Returns true on success.
 template <typename T>
 bool engram::prefetch(T* ptr, std::size_t size);
+
+// The same over an explicit byte range.
+bool engram::prefetch(std::byte* ptr, std::size_t size);
 ```
 
+Both come in a typed and a byte-range form. The typed overloads scale by `sizeof(T)`
+— `warm_cache` covers the whole object even when it spans several cache lines, and
+`prefetch` takes an **element count**, not a byte count. Reach for the `std::byte*`
+overloads when you already have a byte length.
+
 `warm_cache` lowers to a hardware prefetch instruction (`_mm_prefetch` on x86,
-`__prefetch` on ARM/MSVC, `__builtin_prefetch` on GCC/Clang). The `locality`
-argument (`enum class cache_locality`) selects the target cache level, and
+`__prefetch` on ARM/MSVC, `__builtin_prefetch` on GCC/Clang), issued once per
+`ENGRAM_CACHELINE_SZ` bytes (default 64). The `locality` argument
+(`enum class cache_locality`) selects the target cache level, and
 `ioflags` hints the access intent with `flags::read` / `flags::write`:
 
 | `cache_locality` | Meaning                                       |
@@ -592,6 +619,20 @@ if (!a.is_valid() && a.error() == arena_error::stack_overflow) { /* too big */ }
 
 An exhausted arena also records `alloc_failed` when a `push_array` /
 `push_string` request does not fit, and returns an empty span or view.
+
+`push<T>` is the exception: it returns a `T&`, which has no empty value to hand back,
+so an exhausted `push` **aborts** rather than returning a reference to nothing. Check
+`remaining()` first when a request might not fit, or use `push_array` / `push_string`
+and test the result:
+
+```cpp
+if (a.remaining() >= sizeof(Frame))
+    auto& f = a.push<Frame>();      // guaranteed to fit
+```
+
+The abort goes through `ENGRAM_ABORT()`, which defaults to `abort()`. Freestanding
+targets without a working `abort` can define it to their own trap; whatever it expands
+to must not return.
 
 By default, exceptions thrown by the constructors of the objects you push are
 propagated. `push`/`push_array` give the **basic guarantee**: the elements that were
@@ -941,6 +982,36 @@ Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-heade
 For a target with no OS, heap, or vendor runtime, use the single header with
 `ENGRAM_ENABLE_FREESTANDING` — see [Freestanding Builds](#freestanding-builds).
 
+### Build profiles
+
+Most of engram's optional machinery is opt-**out**: tracking counters, the save-point
+stack and PMR are all on by default. `ENGRAM_MINIMAL` is a single macro that turns the
+lot off and keeps only what a bump allocator strictly needs — it applies freestanding's
+trimming while keeping the heap and the OS:
+
+```bash
+cmake -S . -B build -DENGRAM_MINIMAL=ON
+# or: -DCMAKE_CXX_FLAGS=-DENGRAM_MINIMAL
+```
+
+| Kept                                    | Removed                                        |
+| --------------------------------------- | ---------------------------------------------- |
+| Heap, stack, adopted and partitioned arenas | `save` / `restore` / `save_depth`          |
+| `push` / `push_array` / `push_string` and every `pop` | Allocation tracking (`count`, `total` read 0) |
+| `reset`, `data`, and the error accessors | `get_pmr_resource` and `<memory_resource>`     |
+| One native GPU backend per platform      | Every other vendor backend                     |
+| Cache and page prefetch                  | The untyped `pop()` (`ENGRAM_EASY_POP`)        |
+
+The surviving backend is the one that ships with the platform: **DX12** on Windows,
+**Metal** on Apple, **Vulkan** on Linux. The first two are already on by default;
+Vulkan is the one `ENGRAM_MINIMAL` adds, so a Linux build needs the Vulkan headers on
+the include path (or `ENGRAM_VULKAN_HEADER` pointed somewhere else). Exceptions are
+masked, as in a freestanding build.
+
+The result is a **56-byte** arena instead of 648. Each macro in the bundle can also be
+set on its own if you want a different mix — `ENGRAM_MINIMAL` only ever defines them
+when they are not already defined, so it composes with an explicit override.
+
 ### CMake options
 
 Every option maps 1:1 to the preprocessor macro of the same name (except
@@ -952,7 +1023,9 @@ applied to the `engram` target, so anything linking `engram::engram` inherits it
 | `ENGRAM_SINGLE_HEADER`     | `ON`    | `ON` builds an INTERFACE target over `single_header/`; `OFF` compiles `src/engram.cpp` into a static library. |
 | `ENGRAM_BUILD_TESTS`       | `OFF`   | Build the CppUTest suite and register it with CTest.                      |
 | `ENGRAM_ALL`               | `OFF`   | Turn on every backend available on the current platform.                  |
+| `ENGRAM_MINIMAL`           | `OFF`   | Trim to heap + the platform's native GPU backend; see [Build profiles](#build-profiles). |
 | `ENGRAM_DISABLE_PMR`       | `OFF`   | Drop `get_pmr_resource` and the `<memory_resource>` include.              |
+| `ENGRAM_DISABLE_SAVE_RESTORE` | `OFF` | Drop `save` / `restore` / `save_depth` and the save-point stack.          |
 | `ENGRAM_EASY_POP`          | `OFF`   | Record every push so an untyped `pop()` can rewind it.                    |
 | `ENGRAM_ENABLE_SOURCE_INFO`| `OFF`   | Record each arena's creation site; on automatically in `_DEBUG` builds.   |
 | `ENGRAM_ENABLE_VULKAN`     | `OFF`   | Vulkan device memory.                                                     |
@@ -970,14 +1043,55 @@ applied to the `engram` target, so anything linking `engram::engram` inherits it
 | `ENGRAM_ENABLE_GPUDIRECT`  | `OFF`   | CUDA GPUDirect Storage (Linux).                                           |
 | `ENGRAM_ENABLE_DMABUF`     | `OFF`   | Linux dma-buf heaps.                                                      |
 
-Macros without a CMake option — `ENGRAM_MASK_EXCEPTIONS`, `ENGRAM_DISABLE_TRACKING`,
-`ENGRAM_DISABLE_SOURCE_INFO`, `ENGRAM_ENABLE_FREESTANDING`, `ENGRAM_ENABLE_FSEXTRA`,
-`ENGRAM_MAX_SAVE_STACKSZ`, `ENGRAM_MAX_PUSH_DEPTH`, `ENGRAM_FREESTANDING_STACKSZ`
-and the `ENGRAM_*_HEADER` overrides — are set the usual way:
+Macros without a CMake option are set the usual way:
 
 ```bash
 cmake -S . -B build -DCMAKE_CXX_FLAGS="-DENGRAM_MASK_EXCEPTIONS -DENGRAM_MAX_SAVE_STACKSZ=64"
 ```
+
+### All macros
+
+Every macro engram reads, in one place. Anything with a CMake option of the same name
+can be set either way; the rest are compiler defines.
+
+**Profiles** — bundles that set several of the others at once.
+
+| Macro                       | Purpose                                                                 |
+| --------------------------- | ----------------------------------------------------------------------- |
+| `ENGRAM_MINIMAL`            | Heap + one native GPU backend, nothing else. Implies `ENGRAM_DISABLE_PMR`, `ENGRAM_DISABLE_TRACKING`, `ENGRAM_DISABLE_SAVE_RESTORE`, `ENGRAM_MASK_EXCEPTIONS`; switches `ENGRAM_EASY_POP` and the non-native backends off. |
+| `ENGRAM_ALL`                | The opposite: turn on every backend the platform supports.               |
+| `ENGRAM_ENABLE_FREESTANDING`| No OS, heap, PMR or vendor runtime. Single header only; auto-detected from `__STDC_HOSTED__ == 0`. |
+| `ENGRAM_ENABLE_FSEXTRA`     | Bring `warm_cache` back into a freestanding build.                       |
+
+**Features** — each one independently on or off.
+
+| Macro                        | Default | Purpose                                                              |
+| ---------------------------- | ------- | -------------------------------------------------------------------- |
+| `ENGRAM_DISABLE_PMR`         | off     | Drop `get_pmr_resource` and the `<memory_resource>` include.          |
+| `ENGRAM_DISABLE_SAVE_RESTORE`| off     | Drop `save` / `restore` / `save_depth` and the save-point stack.      |
+| `ENGRAM_DISABLE_TRACKING`    | off     | Stop counting allocations; `count()` and `total()` stay but read 0.   |
+| `ENGRAM_EASY_POP`            | off     | Record every push so an untyped `pop()` can rewind it.                |
+| `ENGRAM_ENABLE_SOURCE_INFO`  | on in `_DEBUG` | Record each arena's creation site, readable via `origin()`.    |
+| `ENGRAM_DISABLE_SOURCE_INFO` | off     | Suppress the automatic `_DEBUG` enablement above.                     |
+| `ENGRAM_MASK_EXCEPTIONS`     | off     | Swallow exceptions from element constructors and destructors instead of propagating them. No-op when the compiler has exceptions disabled. |
+
+**Sizes and tunables.**
+
+| Macro                        | Default   | Purpose                                                     |
+| ---------------------------- | --------- | ----------------------------------------------------------- |
+| `ENGRAM_MAX_SAVE_STACKSZ`    | `32`      | Save points held per arena. 16 bytes each, inline.           |
+| `ENGRAM_MAX_PUSH_DEPTH`      | `32`      | Push records per arena under `ENGRAM_EASY_POP`. 16 bytes each. |
+| `ENGRAM_FREESTANDING_STACKSZ`| `65536`   | Stack budget `ENGRAM_STACK_ARENA` is checked against when there is no OS to ask. |
+| `ENGRAM_FALLBACK_PAGESZ`     | `4096`    | Page size assumed when the OS query fails.                   |
+| `ENGRAM_CACHELINE_SZ`        | `64`      | Bytes covered per prefetch instruction in `warm_cache`.      |
+| `ENGRAM_ABORT()`             | `abort()` | Taken on unrecoverable misuse (an exhausted `push<T>`). Must not return. |
+
+**Backends** — `ENGRAM_ENABLE_VULKAN`, `_DX12`, `_CUDA`, `_ROCM`, `_XDNA`, `_OPENCL`,
+`_SYCL`, `_LEVEL_ZERO`, `_WEBGPU`, `_PMDK`, `_DPDK`, `_RDMA`, `_GPUDIRECT`, `_DMABUF`,
+`_METAL`, `_OP_TEE`. DX12 is on by default on Windows and Metal on Apple; the rest are
+opt-in. Each has a matching `ENGRAM_<NAME>_HEADER` macro to override the header engram
+includes for it, plus `ENGRAM_METAL_CPP` / `ENGRAM_METAL_PRIVATE_IMPL` for the Metal
+binding flavour.
 
 `push_md_array` has no option of its own — it appears whenever the compiler is in
 C++23 mode with `<mdspan>` available:
@@ -1004,6 +1118,10 @@ cmake --build build
 # Debug build with creation-site tracking and the easy-pop helpers.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug \
                     -DENGRAM_ENABLE_SOURCE_INFO=ON -DENGRAM_EASY_POP=ON
+cmake --build build
+
+# Smallest possible arena: heap plus the platform's native GPU backend.
+cmake -S . -B build -DENGRAM_MINIMAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 # Run the test suite.
@@ -1091,6 +1209,7 @@ sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
 | [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built plain, with `ENGRAM_MASK_EXCEPTIONS`, with `ENGRAM_ENABLE_SOURCE_INFO`, with `ENGRAM_EASY_POP`, and once as C++23 |
 | [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same five configurations      |
 | [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
+| [`tests/test_profiles.cpp`](tests/test_profiles.cpp)         | Both layouts with `ENGRAM_DISABLE_SAVE_RESTORE`, and both again with `ENGRAM_MINIMAL` — four targets |
 
 The C++23 targets are added only when `check_include_file_cxx` finds `<mdspan>`,
 so a C++20-only toolchain still builds the rest of the suite.
@@ -1102,11 +1221,15 @@ destructor calls, alignment, allocation counting and exhaustion), the dispatchin
 `pop(el)` overload, partitions,
 save/restore, `push_md_array` shape/layout/initialization, creation-site capture,
 the untyped `pop()` under `ENGRAM_EASY_POP` (rewind, zeroing, record-stack bounds,
-and the interplay with typed pops, `reset` and `restore`),
+and the interplay with typed pops, `reset` and `restore`), the advisory
+`warm_cache` / `prefetch` helpers,
 and both exception policies — rollback-and-rethrow by default, truncated spans and
 swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The freestanding suite additionally
 `static_assert`s that the hosted surface (`arena::heap`, `arena::stack`,
-`arena::unpin`, `arena::sync`) is genuinely gone. `test_single_h.cpp` uses
+`arena::unpin`, `arena::sync`) is genuinely gone. The profile suite does the same for
+`save` / `restore` / `save_depth` and PMR, checks that `ENGRAM_MINIMAL` really sets the
+macros it promises and keeps exactly one native backend, and re-runs the core
+allocation behaviour to prove the trimmed build still works. `test_single_h.cpp` uses
 CppUTestExt's mocking to stand up a fake backend and check that `create_custom`
 calls the allocator once and the free hook once, on destruction. Real vendor
 runtimes (CUDA, Vulkan, DX12, …) are out of scope — they need device handles no

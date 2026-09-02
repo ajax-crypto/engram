@@ -106,6 +106,32 @@ engram_add_test(engram_test_single_h_easypop
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
+# Trimmed profiles: what is left once save/restore, and then everything optional,
+# is compiled out.
+engram_add_test(engram_test_hcpp_nosave
+    SOURCES  test_profiles.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_DISABLE_SAVE_RESTORE
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_single_h_nosave
+    SOURCES  test_profiles.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_DISABLE_SAVE_RESTORE
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_hcpp_minimal
+    SOURCES  test_profiles.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ENGRAM_MINIMAL
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_single_h_minimal
+    SOURCES  test_profiles.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    DEFINES  ENGRAM_MINIMAL
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
 engram_add_test(engram_test_freestanding
     SOURCES  test_freestanding.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header

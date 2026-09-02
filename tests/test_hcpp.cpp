@@ -1519,6 +1519,72 @@ TEST(PopDispatch, MdSpansRouteToPopMdArray)
 
 #endif // ENGRAM_HAS_MDSPAN
 
+// ---------------------------------------------------------------------------
+// Cache hints and paging (advisory: the calls must be harmless, not observable)
+// ---------------------------------------------------------------------------
+TEST_GROUP(CacheHints)
+{
+};
+
+TEST(CacheHints, WarmCacheLeavesTheContentsAlone)
+{
+    auto a = arena::heap(8192);
+    auto span = a.push_array<std::byte>(4096);
+    fill(span, 0x5A);
+
+    a.warm_cache(engram::cache_locality::L1, flags::read);
+    a.warm_cache(engram::cache_locality::L2, flags::write, 64, 512);
+    a.warm_cache(span.data(), engram::cache_locality::L3, flags::read);
+
+    CHECK_TRUE(all_equal(span.data(), span.size(), 0x5A));
+}
+
+TEST(CacheHints, WarmCacheCoversTypesLargerThanACacheLine)
+{
+    struct Big { std::byte bytes[256]; };
+
+    auto a = arena::heap(4096);
+    auto& big = a.push<Big>();
+    std::memset(&big, 0x77, sizeof(Big));
+
+    a.warm_cache(&big, engram::cache_locality::L1, flags::read);
+    engram::warm_cache(&big, engram::cache_locality::L1, flags::read);
+
+    CHECK_TRUE(all_equal(reinterpret_cast<std::byte*>(&big), sizeof(Big), 0x77));
+}
+
+TEST(CacheHints, WarmCacheToleratesEdgeRanges)
+{
+    auto a = arena::heap(4096);
+
+    engram::warm_cache(static_cast<std::byte*>(nullptr), 4096, engram::cache_locality::L1, flags::read);
+    engram::warm_cache(a.data().data(), 0, engram::cache_locality::L1, flags::read);
+    a.warm_cache(engram::cache_locality::L1, flags::read, a.capacity(), 0);
+
+    CHECK_TRUE(a.is_valid());
+}
+
+TEST(CacheHints, PrefetchAcceptsAHeapRange)
+{
+    auto a = arena::heap(8192);
+    auto span = a.push_array<int>(256);
+    fill(std::as_writable_bytes(span), 0x11);
+
+    // Element counts, not bytes: the typed overload scales by sizeof(T).
+    engram::prefetch(span.data(), span.size());
+    engram::prefetch(a.data().data(), a.capacity());
+
+    CHECK_TRUE(all_equal(reinterpret_cast<std::byte*>(span.data()), span.size() * sizeof(int), 0x11));
+}
+
+TEST(CacheHints, PrefetchRejectsEmptyRanges)
+{
+    auto a = arena::heap(4096);
+
+    CHECK_FALSE(engram::prefetch(static_cast<std::byte*>(nullptr), 4096));
+    CHECK_FALSE(engram::prefetch(a.data().data(), std::size_t{ 0 }));
+}
+
 int main(int argc, char** argv)
 {
     return CommandLineTestRunner::RunAllTests(argc, argv);

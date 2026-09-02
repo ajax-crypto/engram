@@ -12,6 +12,49 @@
 #error "engram: the header + source build requires a hosted implementation - arena state is heap-allocated through the PIMPL pointer. Use single_header/engram.h, which supports ENGRAM_ENABLE_FREESTANDING."
 #endif
 
+#ifdef ENGRAM_MINIMAL
+// Freestanding's trimming, but the heap and the OS stay: every optional book-keeping
+// feature is off and only the platform's native GPU backend survives.
+#undef ENGRAM_ALL
+#undef ENGRAM_ENABLE_CUDA
+#undef ENGRAM_ENABLE_ROCM
+#undef ENGRAM_ENABLE_OPENCL
+#undef ENGRAM_ENABLE_SYCL
+#undef ENGRAM_ENABLE_LEVEL_ZERO
+#undef ENGRAM_ENABLE_WEBGPU
+#undef ENGRAM_ENABLE_XDNA
+#undef ENGRAM_ENABLE_DPDK
+#undef ENGRAM_ENABLE_OP_TEE
+#undef ENGRAM_ENABLE_PMDK
+#undef ENGRAM_ENABLE_RDMA
+#undef ENGRAM_ENABLE_GPUDIRECT
+#undef ENGRAM_ENABLE_DMABUF
+#undef ENGRAM_EASY_POP
+
+// DX12 (Windows) and Metal (Apple) are switched on by the platform block below;
+// Vulkan is the Linux equivalent and has to be asked for.
+#ifdef __linux__
+#ifndef ENGRAM_ENABLE_VULKAN
+#define ENGRAM_ENABLE_VULKAN
+#endif
+#else
+#undef ENGRAM_ENABLE_VULKAN
+#endif
+
+#ifndef ENGRAM_DISABLE_PMR
+#define ENGRAM_DISABLE_PMR
+#endif
+#ifndef ENGRAM_DISABLE_TRACKING
+#define ENGRAM_DISABLE_TRACKING
+#endif
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
+#define ENGRAM_DISABLE_SAVE_RESTORE
+#endif
+#ifndef ENGRAM_MASK_EXCEPTIONS
+#define ENGRAM_MASK_EXCEPTIONS
+#endif
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -71,8 +114,18 @@
 #endif
 
 /** @brief Depth of the fixed save-point stack used by @ref engram::arena::save. */
-#ifndef ENGRAM_MAX_SAVE_STACKSZ
+#if !defined(ENGRAM_DISABLE_SAVE_RESTORE) && !defined(ENGRAM_MAX_SAVE_STACKSZ)
 #define ENGRAM_MAX_SAVE_STACKSZ 32
+#endif
+
+/** @brief Bytes covered by one prefetch instruction. */
+#ifndef ENGRAM_CACHELINE_SZ
+#define ENGRAM_CACHELINE_SZ 64
+#endif
+
+/** @brief Taken when an unrecoverable misuse is detected; must not return. */
+#ifndef ENGRAM_ABORT
+#define ENGRAM_ABORT() abort()
 #endif
 
 #ifdef _WIN32
@@ -471,12 +524,20 @@ public:
 	 * @brief Construct a `T` in the arena and return a reference to it.
 	 * @tparam T     Type to construct; if `T` is `arena`, a nested arena is created via @ref create.
 	 * @tparam ArgsT Constructor (or @ref create) argument types.
+	 * @details A `T&` cannot report exhaustion, so running out of room aborts rather than
+	 * returning a null reference. Check @ref remaining first, or use @ref push_array /
+	 * @ref push_string, which report failure through an empty result and @ref error.
 	 */
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
 		auto slot = reserve(sizeof(T), true);
-        assert(slot && "engram: push() on an exhausted arena");
+        if (!slot)
+        {
+            assert(false && "engram: push() on an exhausted arena");
+            ENGRAM_ABORT();
+        }
+
         if constexpr (!std::is_same_v<T, arena>)
         {
 #if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
@@ -728,6 +789,7 @@ public:
      */
     void reset() noexcept;
 
+#ifndef ENGRAM_DISABLE_SAVE_RESTORE
     /**
      * @brief Push the current head onto the save stack (an implicit sub-arena marker).
      * @details Save points nest LIFO and are held in a fixed array of
@@ -749,6 +811,7 @@ public:
 
     /** @return Number of save points currently pending. */
     std::size_t save_depth() const noexcept;
+#endif
 
     /** @brief Release pages pinned via `flags::pin_to_physical` (munlock / VirtualUnlock). */
     void unpin();
@@ -807,8 +870,8 @@ public:
     std::size_t used() const noexcept;     ///< @return Bytes currently in use.
     std::size_t capacity() const noexcept; ///< @return Total capacity in bytes.
     std::size_t remaining() const noexcept;///< @return Bytes still available.
-    std::size_t count() const noexcept;    ///< @return Live allocation count (every `push*` that has not been popped).
-    std::size_t total() const noexcept;    ///< @return Lifetime allocation count.
+    std::size_t count() const noexcept;    ///< @return Live allocation count (every `push*` that has not been popped), or 0 when tracking is disabled.
+    std::size_t total() const noexcept;    ///< @return Lifetime allocation count, or 0 when tracking is disabled.
     memory_source source() const noexcept; ///< @return The arena's @ref memory_source.
     arena_error error() const noexcept;    ///< @return The error recorded during creation.
 
