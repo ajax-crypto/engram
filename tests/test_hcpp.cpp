@@ -1196,6 +1196,301 @@ TEST(SourceInfo, OriginSurvivesAMove)
 
 #endif // ENGRAM_ENABLE_SOURCE_INFO
 
+#ifdef ENGRAM_EASY_POP
+
+// ---------------------------------------------------------------------------
+// ENGRAM_EASY_POP: the untyped pop()
+// ---------------------------------------------------------------------------
+TEST_GROUP(EasyPop)
+{
+    void setup() override { Tracked::reset(); }
+};
+
+TEST(EasyPop, PopRewindsASingleObject)
+{
+    auto a = arena::heap(4096);
+
+    auto& value = a.push<int>(42);
+    (void)value;
+    UNSIGNED_LONGS_EQUAL(1u, a.push_depth());
+    UNSIGNED_LONGS_EQUAL(aligned(sizeof(int)), a.used());
+
+    a.pop();
+
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.count());
+}
+
+TEST(EasyPop, PopHandlesEveryKindOfPush)
+{
+    auto a = arena::heap(4096);
+
+    auto& value = a.push<int>(1);
+    (void)value;
+    auto after_value = a.used();
+
+    auto span = a.push_array<float>(32);
+    (void)span;
+    auto after_span = a.used();
+
+    auto fixed = a.push_array<8, double>();
+    (void)fixed;
+    auto after_fixed = a.used();
+
+    auto view = a.push_string(std::string_view{ "engram" });
+    (void)view;
+    UNSIGNED_LONGS_EQUAL(4u, a.push_depth());
+
+    a.pop();
+    UNSIGNED_LONGS_EQUAL(after_fixed, a.used());
+    a.pop();
+    UNSIGNED_LONGS_EQUAL(after_span, a.used());
+    a.pop();
+    UNSIGNED_LONGS_EQUAL(after_value, a.used());
+    a.pop();
+
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+    UNSIGNED_LONGS_EQUAL(0u, a.count());
+}
+
+TEST(EasyPop, PopZeroesTheReclaimedBytes)
+{
+    auto a = arena::heap(4096);
+
+    auto span = a.push_array<std::byte>(256);
+    std::memset(span.data(), 0x5A, span.size());
+
+    a.pop();
+
+    CHECK_TRUE(all_equal(a.data().data(), 256, 0x00));
+}
+
+TEST(EasyPop, NoClearArenasKeepTheReclaimedBytes)
+{
+    alignas(std::max_align_t) unsigned char storage[1024];
+    auto a = arena::adopt(storage, sizeof(storage), flags::no_clear);
+
+    auto span = a.push_array<std::byte>(64);
+    std::memset(span.data(), 0x77, span.size());
+
+    a.pop();
+
+    CHECK_TRUE(all_equal(a.data().data(), 64, 0x77));
+}
+
+TEST(EasyPop, PopRunsNoDestructors)
+{
+    auto a = arena::heap(4096);
+
+    auto span = a.push_array<Tracked>(4, 7);
+    UNSIGNED_LONGS_EQUAL(4u, span.size());
+    LONGS_EQUAL(4, Tracked::constructed);
+
+    a.pop();
+
+    LONGS_EQUAL(0, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(EasyPop, TypedPopsKeepTheRecordStackInStep)
+{
+    auto a = arena::heap(4096);
+
+    auto& value = a.push<int>(1);
+    (void)value;
+    auto span = a.push_array<int>(4);
+    UNSIGNED_LONGS_EQUAL(2u, a.push_depth());
+
+    a.pop_array(span);
+    UNSIGNED_LONGS_EQUAL(1u, a.push_depth());
+
+    a.pop();
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(EasyPop, ResetAndRestoreRewindTheRecordStack)
+{
+    auto a = arena::heap(4096);
+
+    auto& anchor = a.push<int>(1);
+    (void)anchor;
+    CHECK_TRUE(a.save());
+
+    auto span = a.push_array<int>(4);
+    (void)span;
+    auto view = a.push_string(std::string_view{ "abc" });
+    (void)view;
+    UNSIGNED_LONGS_EQUAL(3u, a.push_depth());
+
+    CHECK_TRUE(a.restore());
+    UNSIGNED_LONGS_EQUAL(1u, a.push_depth());
+
+    a.pop();
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+
+    auto& again = a.push<int>(2);
+    (void)again;
+    a.reset();
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+}
+
+TEST(EasyPop, RecordStackIsBounded)
+{
+    auto a = arena::heap(1 << 16);
+
+    for (std::size_t i = 0; i < ENGRAM_MAX_PUSH_DEPTH; ++i)
+    {
+        auto& value = a.push<int>(1);
+        (void)value;
+    }
+
+    UNSIGNED_LONGS_EQUAL((std::size_t)ENGRAM_MAX_PUSH_DEPTH, a.push_depth());
+
+    // One push past the depth limit fails instead of overrunning the record array.
+    auto overflow = a.push_array<int>(1);
+    CHECK_TRUE(overflow.empty());
+    LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
+    UNSIGNED_LONGS_EQUAL((std::size_t)ENGRAM_MAX_PUSH_DEPTH, a.push_depth());
+
+    for (std::size_t i = 0; i < ENGRAM_MAX_PUSH_DEPTH; ++i)
+        a.pop();
+
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(EasyPop, WorksOnAPartition)
+{
+    auto parent = arena::heap(4096);
+    auto sub = parent.partition(1024, 1024);
+
+    auto span = sub.push_array<int>(16);
+    (void)span;
+    UNSIGNED_LONGS_EQUAL(1u, sub.push_depth());
+
+    sub.pop();
+
+    UNSIGNED_LONGS_EQUAL(0u, sub.used());
+    UNSIGNED_LONGS_EQUAL(0u, parent.used());
+}
+
+#endif // ENGRAM_EASY_POP
+
+// ---------------------------------------------------------------------------
+// pop(T&): dispatching on what was pushed
+// ---------------------------------------------------------------------------
+TEST_GROUP(PopDispatch)
+{
+    void setup() override { Tracked::reset(); }
+};
+
+TEST(PopDispatch, PlainObjectsRunTheirDestructor)
+{
+    auto a = arena::heap(4096);
+
+    auto& value = a.push<Tracked>(5);
+    LONGS_EQUAL(1, Tracked::constructed);
+
+    a.pop(value);
+
+    LONGS_EQUAL(1, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.count());
+}
+
+TEST(PopDispatch, SpansRouteToPopArray)
+{
+    auto a = arena::heap(4096);
+
+    auto span = a.push_array<Tracked>(4, 9);
+    LONGS_EQUAL(4, Tracked::constructed);
+
+    a.pop(span);
+
+    LONGS_EQUAL(4, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(PopDispatch, StringViewsRouteToPopString)
+{
+    auto a = arena::heap(4096);
+
+    auto view = a.push_string(std::string_view{ "engram" });
+    UNSIGNED_LONGS_EQUAL(aligned(7), a.used());
+
+    a.pop(view);
+
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+// The std::span<T> overload of pop_array cannot deduce from a static extent.
+TEST(PopDispatch, StaticExtentSpansRewindExactly)
+{
+    auto a = arena::heap(4096);
+
+    auto dynamic = a.push_array<int>(8);
+    std::span<int, 8> fixed{ dynamic.data(), 8 };
+
+    a.pop(fixed);
+
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(PopDispatch, ConstHandlesAreAccepted)
+{
+    auto a = arena::heap(4096);
+
+    const auto span = a.push_array<Tracked>(3);
+    const auto view = a.push_string(std::string_view{ "hi" });
+
+    a.pop(view);
+    a.pop(span);
+
+    LONGS_EQUAL(3, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+TEST(PopDispatch, UnwindsAMixedStackInReverse)
+{
+    auto a = arena::heap(4096);
+
+    auto& one = a.push<Tracked>(1);
+    auto many = a.push_array<Tracked>(2, 2);
+    auto text = a.push_string(std::string_view{ "tail" });
+
+    const auto expected = aligned(sizeof(Tracked)) + aligned(2 * sizeof(Tracked)) + aligned(5);
+    UNSIGNED_LONGS_EQUAL(expected, a.used());
+    LONGS_EQUAL(3, Tracked::constructed);
+
+    a.pop(text);
+    a.pop(many);
+    a.pop(one);
+
+    LONGS_EQUAL(3, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.count());
+}
+
+#ifdef ENGRAM_HAS_MDSPAN
+
+TEST(PopDispatch, MdSpansRouteToPopMdArray)
+{
+    auto a = arena::heap(4096);
+
+    auto grid = a.push_md_array<Tracked, 2>({ 2, 3 }, 4);
+    LONGS_EQUAL(6, Tracked::constructed);
+
+    a.pop(grid);
+
+    LONGS_EQUAL(6, Tracked::destroyed);
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+}
+
+#endif // ENGRAM_HAS_MDSPAN
+
 int main(int argc, char** argv)
 {
     return CommandLineTestRunner::RunAllTests(argc, argv);

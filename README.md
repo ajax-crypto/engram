@@ -264,12 +264,61 @@ auto raw   = a.push_array<float>(1024);   // uninitialized, no work per element
 auto nodes = a.push_array<Node>(16);      // 16 default-constructed Nodes
 ```
 
-Define `ENGRAM_EASY_POP` and the arena remembers each array/string size (up to
-`ENGRAM_MAX_ARRAY_STACKSZ`, default 64), so you can pop without repeating it:
+### Popping by handle
+
+`pop(el)` takes whatever the matching `push*` returned and picks the right pop for
+you: a `std::span` goes to `pop_array`, a `std::basic_string_view` to `pop_string`,
+a `std::mdspan` to `pop_md_array`, and anything else to `pop<T>()`. The dispatch is
+an `if constexpr` chain on the argument's type, so it costs nothing at runtime and
+still destroys every element:
 
 ```cpp
-a.pop_array<float>();               // size recalled automatically
+auto& node = a.push<Node>();
+auto  xs   = a.push_array<float>(256);
+auto  name = a.push_string("engram");
+
+a.pop(name);                        // -> pop_string
+a.pop(xs);                          // -> pop_array, 256 elements
+a.pop(node);                        // -> pop<Node>
 ```
+
+This is the form to reach for in generic code, and it also accepts `const` handles
+and fixed-extent spans (`std::span<float, 256>`), which the plain `pop_array(span)`
+overload cannot deduce. You still have to call it in LIFO order — the arena does not
+check that the handle you pass is really on top.
+
+### Untyped `pop()`
+
+Define `ENGRAM_EASY_POP` and the arena records the pointer and offset of **every**
+push in a fixed array of `ENGRAM_MAX_PUSH_DEPTH` (default 32) entries. That buys
+you an untyped `pop()` that needs no type, no count, and no span:
+
+```cpp
+auto xs = a.push_array<float>(256);
+auto sv = a.push_string("hello");
+
+a.pop();                            // drops the string
+a.pop();                            // drops the array
+```
+
+Because `pop()` does not know the type, it **runs no destructors** — it rewinds the
+offset and, unless the arena was created with `flags::no_clear`, zeroes the bytes it
+reclaimed. Use it for trivially destructible data; keep the typed `pop`,
+`pop_array`, and `pop_string` for anything with a destructor. The two styles
+interoperate freely: typed pops retire their record too, so the stacks stay in step.
+
+`push_depth()` reports how many records are live. A push that would exceed
+`ENGRAM_MAX_PUSH_DEPTH` fails like any other exhausted reservation — it returns
+nothing and sets `arena_error::alloc_failed` — rather than losing the record. Raise
+the macro if you nest deeper:
+
+```cpp
+#define ENGRAM_MAX_PUSH_DEPTH 128
+#define ENGRAM_EASY_POP
+#include <engram.h>
+```
+
+`reset()` and `restore()` rewind the record stack along with everything else.
 
 ### Multi-dimensional arrays (`std::mdspan`)
 
@@ -305,7 +354,7 @@ the layout mapping's `required_span_size()`, so padded layouts get the storage t
 actually index — which is why `pop_md_array` takes the mdspan rather than a count.
 An exhausted arena yields an empty mdspan and records `arena_error::alloc_failed`.
 
-Introspection helpers:
+### Introspection Helpers
 
 ```cpp
 a.is_valid();   // true if the arena holds memory
@@ -326,7 +375,7 @@ a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 Define `ENGRAM_DISABLE_TRACKING` to drop those counters (and the two `std::size_t`
 fields backing them) entirely; both accessors then always return `0`.
 
-`arena` is **move-only**: the copy constructor and copy assignment are deleted,
+> `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
 
 ### Save & Restore (scoped rewind)
@@ -880,7 +929,7 @@ applied to the `engram` target, so anything linking `engram::engram` inherits it
 | `ENGRAM_BUILD_TESTS`       | `OFF`   | Build the CppUTest suite and register it with CTest.                      |
 | `ENGRAM_ALL`               | `OFF`   | Turn on every backend available on the current platform.                  |
 | `ENGRAM_DISABLE_PMR`       | `OFF`   | Drop `get_pmr_resource` and the `<memory_resource>` include.              |
-| `ENGRAM_EASY_POP`          | `OFF`   | Remember each array/string size so `pop_array<T>()` needs no count.       |
+| `ENGRAM_EASY_POP`          | `OFF`   | Record every push so an untyped `pop()` can rewind it.                    |
 | `ENGRAM_ENABLE_SOURCE_INFO`| `OFF`   | Record each arena's creation site; on automatically in `_DEBUG` builds.   |
 | `ENGRAM_ENABLE_VULKAN`     | `OFF`   | Vulkan device memory.                                                     |
 | `ENGRAM_ENABLE_DX12`       | `OFF`   | DirectX 12 (Windows).                                                     |
@@ -899,7 +948,7 @@ applied to the `engram` target, so anything linking `engram::engram` inherits it
 
 Macros without a CMake option — `ENGRAM_MASK_EXCEPTIONS`, `ENGRAM_DISABLE_TRACKING`,
 `ENGRAM_DISABLE_SOURCE_INFO`, `ENGRAM_ENABLE_FREESTANDING`, `ENGRAM_ENABLE_FSEXTRA`,
-`ENGRAM_MAX_SAVE_STACKSZ`, `ENGRAM_MAX_ARRAY_STACKSZ`, `ENGRAM_FREESTANDING_STACKSZ`
+`ENGRAM_MAX_SAVE_STACKSZ`, `ENGRAM_MAX_PUSH_DEPTH`, `ENGRAM_FREESTANDING_STACKSZ`
 and the `ENGRAM_*_HEADER` overrides — are set the usual way:
 
 ```bash
@@ -1015,8 +1064,8 @@ sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
 
 | Test file                                                    | Build under test                                       |
 | ------------------------------------------------------------ | ------------------------------------------------------ |
-| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built plain, with `ENGRAM_MASK_EXCEPTIONS`, with `ENGRAM_ENABLE_SOURCE_INFO`, and once as C++23 |
-| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same four configurations      |
+| [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built plain, with `ENGRAM_MASK_EXCEPTIONS`, with `ENGRAM_ENABLE_SOURCE_INFO`, with `ENGRAM_EASY_POP`, and once as C++23 |
+| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same five configurations      |
 | [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
 
 The C++23 targets are added only when `check_include_file_cxx` finds `<mdspan>`,
@@ -1025,8 +1074,11 @@ so a C++20-only toolchain still builds the rest of the suite.
 Coverage spans the allocation flags, each `memory_source` (including real
 `ENGRAM_STACK_ARENA` storage, which the macro makes testable), `arena_error`
 reporting, element construction, push/pop and array/string round-trips (including
-destructor calls, alignment, allocation counting and exhaustion), partitions,
+destructor calls, alignment, allocation counting and exhaustion), the dispatching
+`pop(el)` overload, partitions,
 save/restore, `push_md_array` shape/layout/initialization, creation-site capture,
+the untyped `pop()` under `ENGRAM_EASY_POP` (rewind, zeroing, record-stack bounds,
+and the interplay with typed pops, `reset` and `restore`),
 and both exception policies — rollback-and-rethrow by default, truncated spans and
 swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The freestanding suite additionally
 `static_assert`s that the hosted surface (`arena::heap`, `arena::stack`,

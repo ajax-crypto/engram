@@ -93,6 +93,19 @@ engram_add_test(engram_test_single_h_srcinfo
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_SOURCE_INFO
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
+# And again with the untyped pop() enabled.
+engram_add_test(engram_test_hcpp_easypop
+    SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+engram_add_test(engram_test_single_h_easypop
+    SOURCES  test_single_h.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
 engram_add_test(engram_test_freestanding
     SOURCES  test_freestanding.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header

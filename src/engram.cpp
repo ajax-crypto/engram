@@ -265,8 +265,14 @@ struct impl_data
 #endif
 
 #ifdef ENGRAM_EASY_POP
-    std::array<std::pair<std::byte*, std::size_t>, ENGRAM_MAX_ARRAY_STACKSZ> m_array_sizes;
-    std::size_t m_array_stacksz = 0;
+    // One entry per push so pop() can rewind without being told what was pushed.
+    struct push_record
+    {
+        std::byte* ptr;
+        std::size_t offset;
+    };
+    std::array<push_record, ENGRAM_MAX_PUSH_DEPTH> m_push_records{};
+    std::size_t m_push_depth = 0;
 #endif
 
     // One entry per pending arena::save(); restore() rewinds to the newest one.
@@ -277,7 +283,7 @@ struct impl_data
         std::size_t count;
 #endif
 #ifdef ENGRAM_EASY_POP
-        std::size_t array_stacksz;
+        std::size_t push_depth;
 #endif
     };
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
@@ -998,7 +1004,7 @@ std::byte* arena::base_ptr() const
 // always max-aligned and every reservation advances the offset by a multiple of
 // this quantum, each returned address is suitably aligned for any standard type
 // and pop remains exact without tracking per-allocation padding.
-std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
+std::byte* arena::reserve(std::size_t bytes, bool countable)
 {
     assert(m_impl && "engram: cannot allocate from a moved-from arena");
     auto& d = *m_impl;
@@ -1009,7 +1015,21 @@ std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
         return nullptr;
     }
 
+#ifdef ENGRAM_EASY_POP
+    // A full record stack fails the reservation rather than losing the record pop()
+    // would need.
+    if (countable && d.m_push_depth >= d.m_push_records.size())
+    {
+        d.m_error = arena_error::alloc_failed;
+        return nullptr;
+    }
+#endif
+
     auto slot = d.m_ptr + d.m_offset;
+#ifdef ENGRAM_EASY_POP
+    if (countable)
+        d.m_push_records[d.m_push_depth++] = { slot, d.m_offset };
+#endif
     d.m_offset += rounded;
 #ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
@@ -1017,14 +1037,9 @@ std::byte* arena::reserve(std::size_t bytes, bool countable, bool track)
         d.m_count++;
         d.m_total++;
     }
-#else
-    (void)countable;
 #endif
-#ifdef ENGRAM_EASY_POP
-    if (track)
-        d.m_array_sizes[d.m_array_stacksz++] = { slot, bytes };
-#else
-    (void)track;
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
+    (void)countable;
 #endif
     return slot;
 }
@@ -1039,29 +1054,40 @@ std::byte* arena::unreserve(std::size_t bytes, bool countable)
 #ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
         --d.m_count;
-#else
+#endif
+#ifdef ENGRAM_EASY_POP
+    if (countable && d.m_push_depth > 0)
+        --d.m_push_depth;
+#endif
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
     (void)countable;
 #endif
     return d.m_ptr + d.m_offset;
 }
 
 #ifdef ENGRAM_EASY_POP
-std::pair<std::byte*, std::size_t> arena::unreserve_tracked(bool countable)
+void arena::pop() noexcept
 {
     auto& d = *m_impl;
-    auto bytes = d.m_array_sizes[d.m_array_stacksz - 1].second;
-    assert(align_up_max(bytes) <= d.m_offset);
+    assert(d.m_push_depth > 0 && "engram: pop() with nothing pushed");
+    if (d.m_push_depth == 0)
+        return;
 
-    d.m_offset -= align_up_max(bytes);
+    const auto& record = d.m_push_records[--d.m_push_depth];
+    assert(record.ptr == d.m_ptr + record.offset);
+
+    // Device storage may not be addressable from the host, so never memset it here.
+    if (d.m_ptr && d.m_clear_on_free && (d.m_type != memory_source::custom) && (d.m_offset > record.offset))
+        memset(d.m_ptr + record.offset, 0, d.m_offset - record.offset);
+
+    d.m_offset = record.offset;
 #ifndef ENGRAM_DISABLE_TRACKING
-    if (countable)
+    if (d.m_count > 0)
         --d.m_count;
-#else
-    (void)countable;
 #endif
-    --d.m_array_stacksz;
-    return { d.m_ptr + d.m_offset, bytes };
 }
+
+std::size_t arena::push_depth() const noexcept { return m_impl ? m_impl->m_push_depth : 0; }
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1151,7 +1177,7 @@ void arena::reset() noexcept
     d.m_count = 0;
 #endif
 #ifdef ENGRAM_EASY_POP
-    d.m_array_stacksz = 0;
+    d.m_push_depth = 0;
 #endif
     d.m_save_stacksz = 0;
 #ifndef ENGRAM_DISABLE_PMR
@@ -1171,7 +1197,7 @@ bool arena::save() noexcept
     sp.count = d.m_count;
 #endif
 #ifdef ENGRAM_EASY_POP
-    sp.array_stacksz = d.m_array_stacksz;
+    sp.push_depth = d.m_push_depth;
 #endif
     return true;
 }
@@ -1192,7 +1218,7 @@ bool arena::restore() noexcept
     d.m_count = sp.count;
 #endif
 #ifdef ENGRAM_EASY_POP
-    d.m_array_stacksz = sp.array_stacksz;
+    d.m_push_depth = sp.push_depth;
 #endif
     return true;
 }

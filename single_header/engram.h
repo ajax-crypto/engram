@@ -102,8 +102,9 @@
 #include <array>
 
 #ifdef ENGRAM_EASY_POP
-#ifndef ENGRAM_MAX_ARRAY_STACKSZ
-#define ENGRAM_MAX_ARRAY_STACKSZ 64
+/** @brief Number of pushes @ref engram::arena::pop can rewind through. */
+#ifndef ENGRAM_MAX_PUSH_DEPTH
+#define ENGRAM_MAX_PUSH_DEPTH 32
 #endif
 #endif
 
@@ -642,6 +643,25 @@ bool prefetch(T* ptr, std::size_t size)
 }
 #endif
 
+namespace detail
+{
+
+// Shape traits backing arena::pop(T&); each is specialised for the one type it names.
+template <typename T> inline constexpr bool is_span_v = false;
+template <typename T, std::size_t Extent> inline constexpr bool is_span_v<std::span<T, Extent>> = true;
+
+template <typename T> inline constexpr bool is_string_view_v = false;
+template <typename CharT, typename Traits>
+inline constexpr bool is_string_view_v<std::basic_string_view<CharT, Traits>> = true;
+
+#ifdef ENGRAM_HAS_MDSPAN
+template <typename T> inline constexpr bool is_mdspan_v = false;
+template <typename T, typename Extents, typename LayoutPolicy, typename AccessorPolicy>
+inline constexpr bool is_mdspan_v<std::mdspan<T, Extents, LayoutPolicy, AccessorPolicy>> = true;
+#endif
+
+} // namespace detail
+
 /**
  * @brief Move-only bump-pointer allocator that owns one block of memory.
  *
@@ -716,7 +736,7 @@ private:
         return { base, built };
     }
 
-    std::byte* reserve(std::size_t bytes, bool countable, bool track)
+    std::byte* reserve(std::size_t bytes, bool countable)
     {
         auto rounded = align_up_max(bytes);
         if (!m_ptr || rounded > m_size - m_offset)
@@ -725,7 +745,21 @@ private:
             return nullptr;
         }
 
+#ifdef ENGRAM_EASY_POP
+        // A full record stack fails the reservation rather than losing the record
+        // pop() would need.
+        if (countable && m_push_depth >= m_push_records.size())
+        {
+            m_error = arena_error::alloc_failed;
+            return nullptr;
+        }
+#endif
+
         auto slot = m_ptr + m_offset;
+#ifdef ENGRAM_EASY_POP
+        if (countable)
+            m_push_records[m_push_depth++] = { slot, m_offset };
+#endif
         m_offset += rounded;
 #ifndef ENGRAM_DISABLE_TRACKING
         if (countable)
@@ -733,14 +767,9 @@ private:
             m_count++;
             m_total++;
         }
-#else
-        (void)countable;
 #endif
-#ifdef ENGRAM_EASY_POP
-        if (track)
-            m_array_sizes[m_array_stacksz++] = { slot, bytes };
-#else
-        (void)track;
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
+        (void)countable;
 #endif
         return slot;
     }
@@ -754,29 +783,16 @@ private:
 #ifndef ENGRAM_DISABLE_TRACKING
         if (countable)
             --m_count;
-#else
+#endif
+#ifdef ENGRAM_EASY_POP
+        if (countable && m_push_depth > 0)
+            --m_push_depth;
+#endif
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
         (void)countable;
 #endif
         return m_ptr + m_offset;
     }
-
-#ifdef ENGRAM_EASY_POP
-    std::pair<std::byte*, std::size_t> unreserve_tracked(bool countable)
-    {
-        auto bytes = m_array_sizes[m_array_stacksz - 1].second;
-        assert(align_up_max(bytes) <= m_offset);
-
-        m_offset -= align_up_max(bytes);
-#ifndef ENGRAM_DISABLE_TRACKING
-        if (countable)
-            --m_count;
-#else
-        (void)countable;
-#endif
-        --m_array_stacksz;
-        return { m_ptr + m_offset, bytes };
-    }
-#endif
 
 public:
 
@@ -797,8 +813,14 @@ public:
 #endif
 
 #ifdef ENGRAM_EASY_POP
-    std::array<std::pair<std::byte*, std::size_t>, ENGRAM_MAX_ARRAY_STACKSZ> m_array_sizes;
-    std::size_t m_array_stacksz = 0;
+    // One entry per push so pop() can rewind without being told what was pushed.
+    struct push_record
+    {
+        std::byte* ptr;
+        std::size_t offset;
+    };
+    std::array<push_record, ENGRAM_MAX_PUSH_DEPTH> m_push_records{};
+    std::size_t m_push_depth = 0;
 #endif
 
     // One entry per pending save(); restore() rewinds to the newest one.
@@ -809,7 +831,7 @@ public:
         std::size_t count;
 #endif
 #ifdef ENGRAM_EASY_POP
-        std::size_t array_stacksz;
+        std::size_t push_depth;
 #endif
     };
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
@@ -1379,8 +1401,8 @@ public:
         m_is_managed = other.m_is_managed;
         m_alignment = other.m_alignment;
 #ifdef ENGRAM_EASY_POP
-        m_array_sizes = std::move(other.m_array_sizes);
-        m_array_stacksz = other.m_array_stacksz;
+        m_push_records = other.m_push_records;
+        m_push_depth = other.m_push_depth;
 #endif
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
         m_origin = other.m_origin;
@@ -1412,8 +1434,8 @@ public:
         m_is_managed = other.m_is_managed;
         m_alignment = other.m_alignment;
 #ifdef ENGRAM_EASY_POP
-        m_array_sizes = std::move(other.m_array_sizes);
-        m_array_stacksz = other.m_array_stacksz;
+        m_push_records = other.m_push_records;
+        m_push_depth = other.m_push_depth;
 #endif
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
         m_origin = other.m_origin;
@@ -1487,7 +1509,7 @@ public:
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
-		auto slot = reserve(sizeof(T), true, false);
+		auto slot = reserve(sizeof(T), true);
         assert(slot && "engram: push() on an exhausted arena");
         if constexpr (!std::is_same_v<T, arena>)
         {
@@ -1523,7 +1545,7 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT (&str)[size])
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::copy(valptr, str, size);
@@ -1535,7 +1557,7 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::assign(valptr, size, fillchar);
@@ -1554,7 +1576,7 @@ public:
 	{
 		assert(size > 0);
 
-		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, true));
+		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true));
 		if (!valptr)
 			return {};
 
@@ -1632,7 +1654,7 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::basic_string_view<CharT, Traits> str)
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true, true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::copy(valptr, str.data(), str.size());
@@ -1644,7 +1666,7 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::size_t size, CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::assign(valptr, size, fillchar);
@@ -1690,24 +1712,63 @@ public:
         unreserve((str.size() + 1) * sizeof(CharT), true);
     }
 
+    /**
+     * @brief Destroy and pop @p el, dispatching on what it is.
+     *
+     * @details A `std::span` routes to @ref pop_array, a `std::basic_string_view` to
+     * @ref pop_string, a `std::mdspan` to @ref pop_md_array, and anything else to the
+     * plain `pop<T>()`. Lets generic code pop whatever a `push*` handed back without
+     * having to name the shape.
+     */
+    template <typename T>
+    void pop(T& el)
+    {
+        using bare = std::remove_cv_t<T>;
+
+        if constexpr (detail::is_span_v<bare>)
+            pop_array<typename bare::element_type>(el.size());
+        else if constexpr (detail::is_string_view_v<bare>)
+            pop_string(el);
+#ifdef ENGRAM_HAS_MDSPAN
+        else if constexpr (detail::is_mdspan_v<bare>)
+            pop_md_array(el);
+#endif
+        else
+            pop<bare>();
+    }
+
 #ifdef ENGRAM_EASY_POP
 
-    /** @brief Pop the most recently pushed array without re-specifying its size (requires `ENGRAM_EASY_POP`). */
-    template <typename T>
-	void pop_array() 
-	{ 
-		auto [valptr, bytes] = unreserve_tracked(true);
-		if constexpr (!std::is_scalar_v<T> && std::is_destructible_v<T>)
-			for (std::size_t idx = 0; idx < bytes / sizeof(T); ++idx)
-				release<T>(valptr + (idx * sizeof(T)));
-	}
-
-    /** @brief Pop the most recently pushed string without re-specifying its size (requires `ENGRAM_EASY_POP`). */
-    template <typename CharT = char, typename Traits = std::char_traits<CharT>>
-    void pop_string()
+    /**
+     * @brief Pop the most recent push, whatever it was (requires `ENGRAM_EASY_POP`).
+     *
+     * @details Every `push*` records the offset it started at, so this rewinds to it
+     * without being told the type or the element count. It runs **no destructors** — use
+     * the typed `pop` / `pop_array` / `pop_string` for anything that needs cleanup. The
+     * reclaimed bytes are zeroed unless the arena was created with `flags::no_clear`.
+     */
+    void pop() noexcept
     {
-        unreserve_tracked(true);
+        assert(m_push_depth > 0 && "engram: pop() with nothing pushed");
+        if (m_push_depth == 0)
+            return;
+
+        const auto& record = m_push_records[--m_push_depth];
+        assert(record.ptr == m_ptr + record.offset);
+
+        // Device storage may not be addressable from the host, so never memset it here.
+        if (m_ptr && m_clear_on_free && (m_type != memory_source::custom) && (m_offset > record.offset))
+            memset(m_ptr + record.offset, 0, m_offset - record.offset);
+
+        m_offset = record.offset;
+#ifndef ENGRAM_DISABLE_TRACKING
+        if (m_count > 0)
+            --m_count;
+#endif
     }
+
+    /** @return Number of pushes @ref pop can still rewind through. */
+    std::size_t push_depth() const noexcept { return m_push_depth; }
 
 #endif
 
@@ -1724,7 +1785,7 @@ public:
         m_count = 0;
 #endif
 #ifdef ENGRAM_EASY_POP
-        m_array_stacksz = 0;
+        m_push_depth = 0;
 #endif
         m_save_stacksz = 0;
 #ifndef ENGRAM_DISABLE_PMR
@@ -1750,7 +1811,7 @@ public:
         sp.count = m_count;
 #endif
 #ifdef ENGRAM_EASY_POP
-        sp.array_stacksz = m_array_stacksz;
+        sp.push_depth = m_push_depth;
 #endif
         return true;
     }
@@ -1778,7 +1839,7 @@ public:
         m_count = sp.count;
 #endif
 #ifdef ENGRAM_EASY_POP
-        m_array_stacksz = sp.array_stacksz;
+        m_push_depth = sp.push_depth;
 #endif
         return true;
     }

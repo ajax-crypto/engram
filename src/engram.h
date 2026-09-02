@@ -64,8 +64,9 @@
 #endif
 
 #ifdef ENGRAM_EASY_POP
-#ifndef ENGRAM_MAX_ARRAY_STACKSZ
-#define ENGRAM_MAX_ARRAY_STACKSZ 64
+/** @brief Number of pushes @ref engram::arena::pop can rewind through. */
+#ifndef ENGRAM_MAX_PUSH_DEPTH
+#define ENGRAM_MAX_PUSH_DEPTH 32
 #endif
 #endif
 
@@ -187,6 +188,25 @@ bool prefetch(T* ptr, std::size_t size)
     return prefetch((std::byte*)ptr, size * sizeof(T));
 }
 
+namespace detail
+{
+
+// Shape traits backing arena::pop(T&); each is specialised for the one type it names.
+template <typename T> inline constexpr bool is_span_v = false;
+template <typename T, std::size_t Extent> inline constexpr bool is_span_v<std::span<T, Extent>> = true;
+
+template <typename T> inline constexpr bool is_string_view_v = false;
+template <typename CharT, typename Traits>
+inline constexpr bool is_string_view_v<std::basic_string_view<CharT, Traits>> = true;
+
+#ifdef ENGRAM_HAS_MDSPAN
+template <typename T> inline constexpr bool is_mdspan_v = false;
+template <typename T, typename Extents, typename LayoutPolicy, typename AccessorPolicy>
+inline constexpr bool is_mdspan_v<std::mdspan<T, Extents, LayoutPolicy, AccessorPolicy>> = true;
+#endif
+
+} // namespace detail
+
 /** @brief Opaque implementation storage (PIMPL); the full definition lives in engram.cpp. */
 struct impl_data;
 
@@ -276,17 +296,12 @@ private:
 
     // Reserve `bytes` at the current head and return its address. Advances the
     // offset; optionally bumps the allocation counters and (for ENGRAM_EASY_POP)
-    // records the block so it can be popped without re-specifying its size.
-    std::byte* reserve(std::size_t bytes, bool countable, bool track);
+    // records the offset so the block can be popped without re-specifying it.
+    std::byte* reserve(std::size_t bytes, bool countable);
 
     // Release `bytes` from the head and return the address of the freed block
     // (post-retreat head) so the caller can run destructors.
     std::byte* unreserve(std::size_t bytes, bool countable);
-
-#ifdef ENGRAM_EASY_POP
-    // Pop the most recently tracked block: returns { address, byte-size }.
-    std::pair<std::byte*, std::size_t> unreserve_tracked(bool countable);
-#endif
 
     // Build an arena that adopts external storage (defined in engram.cpp).
     static arena make_external(std::byte* storage, std::size_t size, int32_t flags ENGRAM_SOURCE_PARAM);
@@ -452,7 +467,7 @@ public:
 	template <typename T, typename... ArgsT>
 	[[nodiscard]] T& push(ArgsT&&... args)
 	{
-		auto slot = reserve(sizeof(T), true, false);
+		auto slot = reserve(sizeof(T), true);
         assert(slot && "engram: push() on an exhausted arena");
         if constexpr (!std::is_same_v<T, arena>)
         {
@@ -488,7 +503,7 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT (&str)[size])
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::copy(valptr, str, size);
@@ -500,7 +515,7 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, false));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::assign(valptr, size, fillchar);
@@ -519,7 +534,7 @@ public:
 	{
 		assert(size > 0);
 
-		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true, true));
+		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true));
 		if (!valptr)
 			return {};
 
@@ -597,7 +612,7 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::basic_string_view<CharT, Traits> str)
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true, true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::copy(valptr, str.data(), str.size());
@@ -609,7 +624,7 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::size_t size, CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true, true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
         if (!valptr)
             return {};
         Traits::assign(valptr, size, fillchar);
@@ -655,24 +670,45 @@ public:
         unreserve((str.size() + 1) * sizeof(CharT), true);
     }
 
+    /**
+     * @brief Destroy and pop @p el, dispatching on what it is.
+     *
+     * @details A `std::span` routes to @ref pop_array, a `std::basic_string_view` to
+     * @ref pop_string, a `std::mdspan` to @ref pop_md_array, and anything else to the
+     * plain `pop<T>()`. Lets generic code pop whatever a `push*` handed back without
+     * having to name the shape.
+     */
+    template <typename T>
+    void pop(T& el)
+    {
+        using bare = std::remove_cv_t<T>;
+
+        if constexpr (detail::is_span_v<bare>)
+            pop_array<typename bare::element_type>(el.size());
+        else if constexpr (detail::is_string_view_v<bare>)
+            pop_string(el);
+#ifdef ENGRAM_HAS_MDSPAN
+        else if constexpr (detail::is_mdspan_v<bare>)
+            pop_md_array(el);
+#endif
+        else
+            pop<bare>();
+    }
+
 #ifdef ENGRAM_EASY_POP
 
-    /** @brief Pop the most recently pushed array without re-specifying its size (requires `ENGRAM_EASY_POP`). */
-    template <typename T>
-	void pop_array() 
-	{ 
-		auto [valptr, bytes] = unreserve_tracked(true);
-		if constexpr (!std::is_scalar_v<T> && std::is_destructible_v<T>)
-			for (std::size_t idx = 0; idx < bytes / sizeof(T); ++idx)
-				release<T>(valptr + (idx * sizeof(T)));
-	}
+    /**
+     * @brief Pop the most recent push, whatever it was (requires `ENGRAM_EASY_POP`).
+     *
+     * @details Every `push*` records the offset it started at, so this rewinds to it
+     * without being told the type or the element count. It runs **no destructors** — use
+     * the typed `pop` / `pop_array` / `pop_string` for anything that needs cleanup. The
+     * reclaimed bytes are zeroed unless the arena was created with `flags::no_clear`.
+     */
+    void pop() noexcept;
 
-    /** @brief Pop the most recently pushed string without re-specifying its size (requires `ENGRAM_EASY_POP`). */
-    template <typename CharT = char, typename Traits = std::char_traits<CharT>>
-    void pop_string()
-    {
-        unreserve_tracked(true);
-    }
+    /** @return Number of pushes @ref pop can still rewind through. */
+    std::size_t push_depth() const noexcept;
 
 #endif
 
