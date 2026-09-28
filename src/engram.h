@@ -199,6 +199,10 @@ namespace flags
     constexpr int32_t no_clear = 32;         ///< Do not zero the storage when the arena is freed.
     constexpr int32_t pin_to_physical = 64;  ///< Lock pages into physical RAM (mlock / VirtualLock).
     constexpr int32_t unified = 128;         ///< Use unified / managed memory (device backends).
+    /// Reserve heap address space without committing/backing it (`mmap(PROT_NONE)` /
+    /// `VirtualAlloc(MEM_RESERVE)`); the range is inaccessible until the caller commits a
+    /// sub-range through platform-specific means.
+    constexpr int32_t reserve_only = 256;
 
     constexpr int32_t read = 1;              ///< Cache-warm read intent (@ref warm_cache ioflags).
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).

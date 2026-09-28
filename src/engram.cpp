@@ -253,6 +253,9 @@ struct impl_data
     std::byte*  m_ptr = nullptr;
 	std::size_t m_offset = 0;
     std::size_t m_size = 0;
+    // Highest m_offset ever reached; unlike m_offset (which pop/restore/reset can rewind),
+    // this only grows, so free-time scrubbing knows the full extent ever written.
+    std::size_t m_high_water = 0;
 #ifndef ENGRAM_DISABLE_TRACKING
     std::size_t m_count = 0, m_total = 0;
 #endif
@@ -467,6 +470,22 @@ static std::size_t get_page_size()
 
 static std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
 {
+    if (flags & engram::flags::reserve_only)
+    {
+        // MAP_NORESERVE keeps this out of the overcommit accounting too, since nothing will
+        // ever be written until the caller commits a sub-range through platform-specific means.
+#ifdef __APPLE__
+        int mapflags = MAP_ANON | MAP_PRIVATE;
+#elif __linux__
+        int mapflags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE;
+#else
+        int mapflags = MAP_ANONYMOUS | MAP_PRIVATE;
+#endif
+        void* addr = mmap(NULL, size, PROT_NONE, mapflags, -1, 0);
+        if (addr == MAP_FAILED) return { nullptr, false };
+        return { (std::byte*)addr, true };
+    }
+
     auto shared = (flags & (engram::flags::shared | engram::flags::unified)) != 0;
     auto contiguous = (flags & engram::flags::true_contiguous) != 0;
 
@@ -592,7 +611,11 @@ static std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
     (void)fd;
 	void* memory = nullptr;
 	auto isStdLib = false;
-	if (flags & engram::flags::true_contiguous) 
+	if (flags & engram::flags::reserve_only)
+		// Reserve address space only; the caller must VirtualAlloc(MEM_COMMIT) a sub-range
+		// before touching it.
+		memory = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+	else if (flags & engram::flags::true_contiguous) 
 		memory = allocate_contiguous(size);
 	else if (flags & engram::flags::shared)
 		memory = VirtualAlloc2(
@@ -619,7 +642,7 @@ static std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
 #endif
 	}
 
-    if (flags & engram::flags::pin_to_physical)
+    if ((flags & engram::flags::pin_to_physical) && !(flags & engram::flags::reserve_only))
         VirtualLock(memory, size);
 	
 	return { (std::byte*)memory, !isStdLib };
@@ -641,7 +664,7 @@ static void heap_free(impl_data& arena)
     if (arena.m_ptr)
     {
         if (arena.m_clear_on_free)
-            memset(arena.m_ptr, 0, arena.m_size);
+            memset(arena.m_ptr, 0, arena.m_high_water);
 
         if (arena.m_use_sys_free)
 #ifdef _WIN32
@@ -710,22 +733,23 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
     if (fd != -1)
         flags |= engram::flags::unified;
 
-    arena result;
-    auto& d = *result.m_impl;
-    d.m_type = type;
-    d.m_size = size;
-    d.m_clear_on_free = !(flags & engram::flags::no_clear);
-#ifdef ENGRAM_ENABLE_SOURCE_INFO
-    d.m_origin = loc;
-#endif
-
     if ((flags & engram::flags::page_aligned) && (type != memory_source::custom))
     {
         auto pagesz = get_page_size();
         if (pagesz > alignment)
             alignment = pagesz;
-        size = ((size / pagesz) + 1) * pagesz;
+        size = ((size + pagesz - 1) / pagesz) * pagesz;
     }
+
+    arena result;
+    auto& d = *result.m_impl;
+    d.m_type = type;
+    // Captured after rounding, so m_size matches what actually gets allocated.
+    d.m_size = size;
+    d.m_clear_on_free = !(flags & engram::flags::no_clear);
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+    d.m_origin = loc;
+#endif
 
     // Stack arenas come from ENGRAM_STACK_ARENA; external and custom from
     // adopt / create_custom.
@@ -735,7 +759,8 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
 
         if (d.m_ptr != nullptr) 
         {
-            if (flags & engram::flags::commit)
+            // A reserve_only range isn't backed/accessible yet, so it can't be zeroed here.
+            if ((flags & engram::flags::commit) && !(flags & engram::flags::reserve_only))
                 memset(d.m_ptr, 0, size);
         }
         else d.m_error = arena_error::alloc_failed;
@@ -1033,6 +1058,8 @@ std::byte* arena::reserve(std::size_t bytes, bool countable)
         d.m_push_records[d.m_push_depth++] = { slot, d.m_offset };
 #endif
     d.m_offset += rounded;
+    if (d.m_offset > d.m_high_water)
+        d.m_high_water = d.m_offset;
 #ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
     {
@@ -1141,7 +1168,7 @@ arena::~arena()
     auto& d = *m_impl;
     switch (d.m_type)
     {
-        case memory_source::stack: if (d.m_ptr && d.m_clear_on_free) { memset(d.m_ptr, 0, d.m_size); } break;
+        case memory_source::stack: if (d.m_ptr && d.m_clear_on_free) { memset(d.m_ptr, 0, d.m_high_water); } break;
         case memory_source::heap: heap_free(d); break;
         case memory_source::external: break;
         case memory_source::custom: if (d.m_extra) ((void(*)(impl_data&))d.m_extra)(d); break;
@@ -1634,21 +1661,32 @@ void allocate_vulkan(impl_data& arena, VkDevice& device, VkPhysicalDevice& physi
             void* out = nullptr;
 			
 			if ((vkAllocateMemory(device, &allocInfo, allocCbs, &memory) == VK_SUCCESS) &&
-			    (vkBindBufferMemory(device, buffer, memory, offset) == VK_SUCCESS) &&
-				(vkMapMemory(device, memory, offset, VK_WHOLE_SIZE, vkflags, &out) == VK_SUCCESS))
+			    (vkBindBufferMemory(device, buffer, memory, offset) == VK_SUCCESS))
 			{
-				arena.m_ptr = (std::byte*)out;
-                vk_mem_info_map.emplace(std::piecewise_construct, std::forward_as_tuple(arena.m_ptr), 
-					std::forward_as_tuple(device, buffer, memory));
-					
-				if (flags & engram::flags::commit)
-					std::memset(arena.m_ptr, 0, arena.m_size);
-					
-				arena.m_use_sys_free = true;
-                arena.m_extra = &free_vulkan;
-                arena.m_type = memory_source::custom;
+                if (vkMapMemory(device, memory, offset, VK_WHOLE_SIZE, vkflags, &out) == VK_SUCCESS)
+                {
+                    arena.m_ptr = (std::byte*)out;
+                    vk_mem_info_map.emplace(std::piecewise_construct, std::forward_as_tuple(arena.m_ptr), 
+                        std::forward_as_tuple(device, buffer, memory));
+                        
+                    if (flags & engram::flags::commit)
+                        std::memset(arena.m_ptr, 0, arena.m_size);
+                        
+                    arena.m_use_sys_free = true;
+                    arena.m_extra = &free_vulkan;
+                    arena.m_type = memory_source::custom;
+                }
+                else
+                {
+                    vkFreeMemory(device, memory, nullptr);
+                    vkDestroyBuffer(device, buffer, nullptr);
+                }
 			}
+            else
+                vkDestroyBuffer(device, buffer, nullptr);
 		}
+        else
+            vkDestroyBuffer(device, buffer, nullptr);
 	}
 	
 	handle_heap_fallback(arena, flags);

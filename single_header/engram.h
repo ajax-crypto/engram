@@ -490,6 +490,10 @@ namespace flags
     constexpr int32_t no_clear = 32;         ///< Do not zero the storage when the arena is freed.
     constexpr int32_t pin_to_physical = 64;  ///< Lock pages into physical RAM (mlock / VirtualLock).
     constexpr int32_t unified = 128;         ///< Use unified / managed memory (device backends).
+    /// Reserve heap address space without committing/backing it (`mmap(PROT_NONE)` /
+    /// `VirtualAlloc(MEM_RESERVE)`); the range is inaccessible until the caller commits a
+    /// sub-range through platform-specific means.
+    constexpr int32_t reserve_only = 256;
 
     constexpr int32_t read = 1;              ///< Cache-warm read intent (@ref warm_cache ioflags).
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).
@@ -854,6 +858,8 @@ private:
             m_push_records[m_push_depth++] = { slot, m_offset };
 #endif
         m_offset += rounded;
+        if (m_offset > m_high_water)
+            m_high_water = m_offset;
 #ifndef ENGRAM_DISABLE_TRACKING
         if (countable)
         {
@@ -894,6 +900,9 @@ public:
 	std::byte*  m_ptr = nullptr;
 	std::size_t m_offset = 0;
     std::size_t m_size = 0;
+    // Highest m_offset ever reached; unlike m_offset (which pop/restore/reset can rewind),
+    // this only grows, so free-time scrubbing knows the full extent ever written.
+    std::size_t m_high_water = 0;
 #ifndef ENGRAM_DISABLE_TRACKING
     std::size_t m_count = 0, m_total = 0;
 #endif
@@ -959,23 +968,23 @@ public:
 
 		arena result;
         result.m_type = type;
-        result.m_size = size;
-        result.m_clear_on_free = !(flags & engram::flags::no_clear);
-#ifdef ENGRAM_ENABLE_SOURCE_INFO
-        result.m_origin = loc;
-#endif
-
 #ifndef ENGRAM_ENABLE_FREESTANDING
         if ((flags & engram::flags::page_aligned) && (type != memory_source::custom))
         {
             auto pagesz = get_page_size();
             if (pagesz > alignment)
                 alignment = pagesz;
-            size = ((size / pagesz) + 1) * pagesz;
+            size = ((size + pagesz - 1) / pagesz) * pagesz;
         }
 #else
         (void)alignment;
         (void)fd;
+#endif
+        // Captured after rounding, so m_size matches what actually gets allocated.
+        result.m_size = size;
+        result.m_clear_on_free = !(flags & engram::flags::no_clear);
+#ifdef ENGRAM_ENABLE_SOURCE_INFO
+        result.m_origin = loc;
 #endif
 		
 		// Stack arenas come from ENGRAM_STACK_ARENA; external and custom from
@@ -987,7 +996,8 @@ public:
 
 			if (result.m_ptr != nullptr) 
 			{
-				if (flags & engram::flags::commit)
+				// A reserve_only range isn't backed/accessible yet, so it can't be zeroed here.
+				if ((flags & engram::flags::commit) && !(flags & engram::flags::reserve_only))
 					memset(result.m_ptr, 0, size);
 			}
 			else result.m_error = arena_error::alloc_failed;
@@ -1553,7 +1563,7 @@ public:
 	{
 		switch (m_type)
 		{
-			case memory_source::stack: if (m_ptr && m_clear_on_free) { memset(m_ptr, 0, m_size); } break;
+			case memory_source::stack: if (m_ptr && m_clear_on_free) { memset(m_ptr, 0, m_high_water); } break;
 #ifndef ENGRAM_ENABLE_FREESTANDING
 			case memory_source::heap: heap_free(*this); break;
 #endif
@@ -2308,17 +2318,34 @@ inline std::size_t get_page_size()
 
 inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t flags, std::size_t alignment, int fd = -1)
 {
+    if (flags & engram::flags::reserve_only)
+    {
+        // MAP_NORESERVE keeps this out of the overcommit accounting too, since nothing will
+        // ever be written until the caller commits a sub-range through platform-specific means.
+#ifdef __APPLE__
+        int mapflags = MAP_ANON | MAP_PRIVATE;
+#elif __linux__
+        int mapflags = MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE;
+#else
+        int mapflags = MAP_ANONYMOUS | MAP_PRIVATE;
+#endif
+        void* addr = mmap(NULL, size, PROT_NONE, mapflags, -1, 0);
+        if (addr == MAP_FAILED) return { nullptr, false };
+        return { (std::byte*)addr, true };
+    }
+
     auto shared = (flags & (engram::flags::shared | engram::flags::unified)) != 0;
     auto contiguous = (flags & engram::flags::true_contiguous) != 0;
 
 	if (shared || contiguous)
 	{
-        auto fd = 
+        auto mapfd = 
 #ifdef __linux__
 		    (flags & engram::flags::unified) ? fd : -1;
 #else
             -1;
 #endif
+        int mapflags =
 #ifdef __APPLE__
             MAP_ANON | 
 #else
@@ -2332,11 +2359,11 @@ inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
             0 |
 #endif
             (shared ? MAP_SHARED : MAP_PRIVATE);
-		void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE, flags, 
+		void *addr = mmap(NULL, size, PROT_READ | PROT_WRITE, mapflags, 
 #ifdef __APPLE__
             contiguous ? VM_FLAGS_SUPERPAGE_SIZE_2MB : -1, 
 #else
-            fd,
+            mapfd,
 #endif
             0);
 		if (addr == MAP_FAILED) return { nullptr, false };
@@ -2432,7 +2459,11 @@ inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
     (void)fd;
 	void* memory = nullptr;
 	auto isStdLib = false;
-	if (flags & engram::flags::true_contiguous) 
+	if (flags & engram::flags::reserve_only)
+		// Reserve address space only; the caller must VirtualAlloc(MEM_COMMIT) a sub-range
+		// before touching it.
+		memory = VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+	else if (flags & engram::flags::true_contiguous) 
 		memory = allocate_contiguous(size);
 	else if (flags & engram::flags::shared)
 		memory = VirtualAlloc2(
@@ -2459,7 +2490,7 @@ inline std::pair<std::byte*, bool> heap_allocate_impl(std::size_t size, int32_t 
 #endif
 	}
 
-    if (flags & engram::flags::pin_to_physical)
+    if ((flags & engram::flags::pin_to_physical) && !(flags & engram::flags::reserve_only))
         VirtualLock(memory, size);
 	
 	return { (std::byte*)memory, !isStdLib };
@@ -2482,7 +2513,7 @@ inline void heap_free(arena& arena)
     if (arena.m_ptr)
     {
         if (arena.m_clear_on_free)
-            memset(arena.m_ptr, 0, arena.m_size);
+            memset(arena.m_ptr, 0, arena.m_high_water);
 
         if (arena.m_use_sys_free)
 #ifdef _WIN32
@@ -2679,21 +2710,32 @@ inline void allocate_vulkan(arena& arena, VkDevice& device, VkPhysicalDevice& ph
             void* out = nullptr;
 			
 			if ((vkAllocateMemory(device, &allocInfo, allocCbs, &memory) == VK_SUCCESS) &&
-			    (vkBindBufferMemory(device, buffer, memory, offset) == VK_SUCCESS) &&
-				(vkMapMemory(device, memory, offset, VK_WHOLE_SIZE, vkflags, &out) == VK_SUCCESS))
+			    (vkBindBufferMemory(device, buffer, memory, offset) == VK_SUCCESS))
 			{
-				arena.m_ptr = (std::byte*)out;
-                vk_mem_info_map.emplace(std::piecewise_construct, std::forward_as_tuple(arena.m_ptr), 
-					std::forward_as_tuple(device, buffer, memory));
-					
-				if (flags & engram::flags::commit)
-					std::memset(arena.m_ptr, 0, arena.m_size);
-					
-				arena.m_use_sys_free = true;
-                arena.m_extra = &free_vulkan;
-                arena.m_type = memory_source::custom;
+                if (vkMapMemory(device, memory, offset, VK_WHOLE_SIZE, vkflags, &out) == VK_SUCCESS)
+                {
+                    arena.m_ptr = (std::byte*)out;
+                    vk_mem_info_map.emplace(std::piecewise_construct, std::forward_as_tuple(arena.m_ptr), 
+                        std::forward_as_tuple(device, buffer, memory));
+                        
+                    if (flags & engram::flags::commit)
+                        std::memset(arena.m_ptr, 0, arena.m_size);
+                        
+                    arena.m_use_sys_free = true;
+                    arena.m_extra = &free_vulkan;
+                    arena.m_type = memory_source::custom;
+                }
+                else
+                {
+                    vkFreeMemory(device, memory, nullptr);
+                    vkDestroyBuffer(device, buffer, nullptr);
+                }
 			}
+            else
+                vkDestroyBuffer(device, buffer, nullptr);
 		}
+        else
+            vkDestroyBuffer(device, buffer, nullptr);
 	}
 	
 	handle_heap_fallback(arena, flags);
