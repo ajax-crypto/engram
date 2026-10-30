@@ -7,9 +7,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(pybind11 CONFIG REQUIRED)
 
-# Bind against the single-header build so no separate engram.cpp is needed.
-pybind11_add_module(_engram engram_ext.cpp)
-target_include_directories(_engram PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../single_header)
+# Bind against the header + source build: single_header/engram.h is
+# freestanding-only (stack/external arenas, no heap, no vendor backends), so the
+# bindings need the full-featured split build instead.
+pybind11_add_module(_engram engram_ext.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/engram.cpp)
+target_include_directories(_engram PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_features(_engram PRIVATE cxx_std_20)
 
 # Optional: drop the per-allocation count/total counters (Arena.count / Arena.total
@@ -38,12 +40,14 @@ if(ENGRAM_ENABLE_SOURCE_INFO)
     target_compile_definitions(_engram PRIVATE ENGRAM_ENABLE_SOURCE_INFO)
 endif()
 
-# The single header auto-enables the platform's default device backend
-# (DirectX 12 on Windows, Metal on Apple); link the corresponding system
-# libraries. No third-party SDK is required.
+# src/engram.h auto-enables the platform's default device backend on Windows
+# (DirectX 12); Metal needs an explicit define there since it has no auto-enable
+# or CMake option of its own. Link the corresponding system libraries — no
+# third-party SDK is required for either.
 if(WIN32)
     target_link_libraries(_engram PRIVATE d3d12 dxgi d3dcompiler)
 elseif(APPLE)
+    target_compile_definitions(_engram PRIVATE ENGRAM_ENABLE_METAL)
     target_link_libraries(_engram PRIVATE
         "-framework Metal" "-framework Foundation" "-framework QuartzCore" objc)
 endif()

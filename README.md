@@ -50,8 +50,10 @@ scattering `new`/`delete`, `alloca`, `cudaMalloc`, and friends throughout your
 code, you create an `arena` for the target you want and then `push` objects and
 arrays into it. The arena reclaims everything when it is destroyed.
 
-Everything is exposed through the `engram` namespace. Both layouts present the
-identical `arena` API, so the include is all that differs:
+Everything is exposed through the `engram` namespace. The two layouts cover
+different scopes, not the same API: the single header is freestanding-only
+(stack and external arenas), while the header + source pair is the full,
+hosted build (adds heap, PMR, and every vendor backend).
 
 ```cpp
 #include "engram.h"     // single_header/engram.h  — or  src/engram.h
@@ -64,28 +66,29 @@ helpers appear on their own.
 
 ## Choosing a layout: single header vs. header + source
 
-engram is distributed in two forms that share the same `engram::arena` API:
+engram is distributed in two forms with **different scopes** — the single
+header is not a drop-in subset of the same API, it only ever builds the
+freestanding surface:
 
 |                     | **Single header** (`single_header/engram.h`)                     | **Header + source** (`src/engram.h` + `src/engram.cpp`)                              |
 | ------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Scope                | Freestanding only: `memory_source::stack` and `::external` arenas | Full build: adds `memory_source::heap`, PMR, and every vendor/device backend        |
 | Integration         | Copy one header and `#include` it — no build step                | Add `engram.h` to your includes **and** compile/link `engram.cpp`                   |
-| Vendor SDK headers  | Pulled into **every** TU that enables a backend                  | Confined to `engram.cpp`; users of `engram.h` need no vendor SDK on their include path |
-| Compile time        | Every including TU recompiles the whole implementation           | Implementation compiled once; consuming TUs stay lightweight                        |
+| Target              | A bootloader, kernel, RTOS task, or bare metal — no OS, no heap   | Any hosted C++20 target                                                              |
+| Vendor SDK headers  | None — the single header never includes a vendor SDK              | Confined to `engram.cpp`; users of `engram.h` need no vendor SDK on their include path |
+| Compile time        | Every including TU recompiles the (small) freestanding implementation | Implementation compiled once; consuming TUs stay lightweight                    |
 | Encapsulation       | Internals visible in the header                                  | Internals hidden behind the opaque pointer; changing them doesn't force a rebuild    |
 | Runtime cost        | State stored inline in `arena` — no indirection, no extra alloc  | One heap allocation for `impl_data` per arena + a pointer hop to reach state         |
-| Creation API        | Typed `arena::create_vulkan/_dx12/…` factories **and** `create_custom` | Single `arena::create_custom(size, custom, flags, …)` enum dispatch            |
-| Freestanding        | Supported via `ENGRAM_ENABLE_FREESTANDING` (see [Freestanding Builds](#freestanding-builds)) | **Not possible** — the PIMPL `impl_data` is heap-allocated per arena; the header `#error`s out |
+| Creation API        | `ENGRAM_STACK_ARENA` and `arena::adopt` only                      | `arena::heap`, `arena::adopt`, and `arena::create_custom(size, custom, flags, …)` enum dispatch |
 
-**Use the single header** for quick integration, small projects, or when you want
-zero build configuration and don't mind the extra per-TU compile cost.
+**Use the single header** for a freestanding target, or anywhere you only need
+stack/external arenas and want zero build configuration.
 
-**Use the header + source** for larger codebases: faster incremental builds, a
-clean public header that doesn't drag vendor SDK headers (CUDA, Vulkan, DX12, …)
-into your translation units, and the freedom to change the implementation without
-recompiling everything that includes it.
+**Use the header + source** for everything else: heap arenas, PMR, device /
+vendor backends, and hosted applications generally.
 
-The bundled CMake exposes `ENGRAM_SINGLE_HEADER` (default `ON`) to switch between
-them — see [Building](#building).
+The bundled CMake exposes `ENGRAM_SINGLE_HEADER` (default `OFF`) to switch
+between them — see [Building](#building).
 
 ## Memory Targets
 
@@ -98,8 +101,10 @@ Targets are described by `memory_source`:
 | `memory_source::external`  | A user-supplied buffer the arena does not own          |
 | `memory_source::custom`    | Any user allocator, including the device backends below |
 
-On a target with no OS or heap, `ENGRAM_ENABLE_FREESTANDING` narrows this to
-`stack` and `external` — see [Freestanding Builds](#freestanding-builds).
+> This table, and the rest of this section through [Optional Backends](#optional-backends),
+> describes the **header + source** build. `single_header/engram.h` is
+> freestanding-only — see [Freestanding single header](#freestanding-single-header) —
+> so it only ever has `stack` and `external`; `heap` and `custom` don't exist there.
 
 Optional accelerator/device backends are compiled in via preprocessor switches
 (see [Optional Backends](#optional-backends)):
@@ -652,8 +657,9 @@ no arena operation ever throws:
 - Destructors invoked by `pop`/`pop_array`/`pop_string` that throw are ignored.
 
 The macro only takes effect when the compiler has exceptions enabled; with exceptions
-disabled it is a no-op (engram emits no `try`/`catch`). Freestanding builds define it
-automatically — see [Freestanding Builds](#freestanding-builds).
+disabled it is a no-op (engram emits no `try`/`catch`). The single header defines it
+automatically, since it is always freestanding — see
+[Freestanding single header](#freestanding-single-header).
 
 ### Creation-site tracking
 
@@ -701,6 +707,9 @@ if (!a.is_valid())
 > this for you.
 
 ## Optional Backends
+
+> Header + source only — `single_header/engram.h` is freestanding-only and
+> never compiles in a vendor backend.
 
 Device and accelerator backends are opt-in. Define the corresponding macro
 before including the header (or define `ENGRAM_ALL` to enable every backend
@@ -892,15 +901,14 @@ path by defining the matching macro before including `engram.h`:
 (DirectX 12 uses fixed system headers and is not overridable. GPUDirect also
 includes `<cuda_runtime.h>` unconditionally.)
 
-## Freestanding Builds
+## Freestanding single header
 
-Define `ENGRAM_ENABLE_FREESTANDING` to build the **single header** against a
-target with no operating system, no heap, and no vendor SDKs — a bootloader, a
-kernel, an RTOS task, or bare metal:
+`single_header/engram.h` is **always** freestanding: no operating system, no
+heap, and no vendor SDKs — it targets a bootloader, a kernel, an RTOS task, or
+bare metal. There is nothing to opt into; just include it:
 
 ```cpp
-#define ENGRAM_ENABLE_FREESTANDING
-#include "engram.h"
+#include "engram.h"   // single_header/engram.h
 
 alignas(std::max_align_t) static std::byte pool[64 * 1024];
 
@@ -908,19 +916,16 @@ auto a = engram::arena::adopt(pool, sizeof(pool), engram::flags::commit);
 ENGRAM_STACK_ARENA(scratch, 1024);
 ```
 
-You usually don't have to define it yourself: the header turns the mode on
-automatically when the compiler reports a freestanding implementation via
-`__STDC_HOSTED__ == 0` (`-ffreestanding` on GCC/Clang, and most bare-metal
-toolchains by default). Defining `ENGRAM_ENABLE_FREESTANDING` explicitly is for
-the cases the compiler doesn't advertise.
+`ENGRAM_ENABLE_FREESTANDING` is still defined internally (and left available for
+any code that wants to check for it), but it can no longer be turned off — the
+header carries no hosted code path for it to fall back to. It implies
+`ENGRAM_DISABLE_PMR`, since `std::pmr::monotonic_buffer_resource` is a hosted
+facility, and `ENGRAM_MASK_EXCEPTIONS`, since there is rarely anything out here
+to catch a throwing constructor. No OS header (`<sys/mman.h>`, `<pthread.h>`,
+`<windows.h>`, …) and no vendor SDK header is included, ever.
 
-The macro force-`#undef`s every `ENGRAM_ENABLE_*` backend switch (plus
-`ENGRAM_ALL` and the Metal macros), so it always wins over anything your build
-system passes in. It also implies `ENGRAM_DISABLE_PMR`, since
-`std::pmr::monotonic_buffer_resource` is a hosted facility, and
-`ENGRAM_MASK_EXCEPTIONS`, since there is rarely anything out here to catch a
-throwing constructor. No OS header
-(`<sys/mman.h>`, `<pthread.h>`, `<windows.h>`, …) is included.
+Need heap arenas or a vendor/device backend? Use the
+[header + source build](#choosing-a-layout-single-header-vs-header--source) instead.
 
 **What you keep:** stack and adopted arenas, and every arena feature built on
 them — `push` / `push_array` / `push_string`, the matching `pop`s (including
@@ -928,15 +933,15 @@ them — `push` / `push_array` / `push_string`, the matching `pop`s (including
 introspection accessors. `ENGRAM_STACK_ARENA` works unchanged; the size check
 uses `ENGRAM_FREESTANDING_STACKSZ` instead of asking the OS.
 
-**What is compiled out:**
+**What does not exist in the single header:**
 
-| Removed                                            | Why                                  |
-| -------------------------------------------------- | ------------------------------------ |
-| `arena::heap`, `arena::heapfile`, `memory_source::heap` | No heap.                        |
-| `flags::heap_fallback`, `page_aligned`, `true_contiguous`, `shared`, `pin_to_physical`, and `arena::unpin()` | Heap / OS paging only. |
-| `arena::create_custom` and every `arena::create_<vendor>` factory | No vendor runtimes.    |
-| `arena::sync(...)` / `arena::prefetch(...)`, and the free `engram::prefetch` | Device runtimes and OS paging. |
-| `arena::get_pmr_resource(...)`                     | Implied `ENGRAM_DISABLE_PMR`.        |
+| Not present                                        | Why                                   | Where to find it instead       |
+| -------------------------------------------------- | -------------------------------------- | ------------------------------- |
+| `arena::heap`, `arena::heapfile`, `memory_source::heap`, `memory_source::custom` | No heap, no OS, no device backends. | Header + source build          |
+| `flags::heap_fallback`, `page_aligned`, `true_contiguous`, `shared`, `pin_to_physical`, and `arena::unpin()` | Heap / OS paging only. | Header + source build |
+| `arena::create`, `arena::create_custom`, and every `arena::create_<vendor>` factory | No vendor runtimes.    | Header + source build          |
+| `arena::sync(...)` / `arena::prefetch(...)`, and the free `engram::prefetch` | Device runtimes and OS paging. | Header + source build  |
+| `arena::get_pmr_resource(...)`                     | Implied `ENGRAM_DISABLE_PMR`.          | Header + source build          |
 
 Because there is nothing to query for the thread's stack bounds, stack arenas are
 checked against `ENGRAM_FREESTANDING_STACKSZ` (default 64 KiB); define it to match
@@ -959,9 +964,9 @@ free `engram::warm_cache` and both `arena::warm_cache` overloads:
 `engram::prefetch` stays out even with `ENGRAM_ENABLE_FSEXTRA` — it is a request
 to the OS pager (`madvise` / `PrefetchVirtualMemory`), and there is no pager.
 
-> Neither macro changes anything in a normal build: all of the above is enabled
-> by default, and `ENGRAM_ENABLE_FSEXTRA` has no effect without
-> `ENGRAM_ENABLE_FREESTANDING`.
+> `ENGRAM_ENABLE_FSEXTRA` has no effect unless the single header is in use —
+> the header + source build never defines `ENGRAM_ENABLE_FREESTANDING` in the
+> first place.
 
 > Freestanding applies to the **single header only**. The header + source pair
 > stores its state behind an opaque `impl_data*` that the constructor allocates
@@ -975,14 +980,16 @@ to the OS pager (`madvise` / `PrefetchVirtualMemory`), and there is no pager.
 Pick a layout (see [Choosing a layout](#choosing-a-layout-single-header-vs-header--source)):
 
 - **Single header** — add `single_header/engram.h` to your include path and
-  `#include` it. No build step.
+  `#include` it. No build step. Freestanding-only — see
+  [Freestanding single header](#freestanding-single-header).
 - **Header + source** — add `src/` to your includes and compile `src/engram.cpp`
   into your target (or link the library the bundled `CMakeLists.txt` builds).
-
-For a target with no OS, heap, or vendor runtime, use the single header with
-`ENGRAM_ENABLE_FREESTANDING` — see [Freestanding Builds](#freestanding-builds).
+  This is the full build: heap, PMR, and every vendor backend.
 
 ### Build profiles
+
+> Header + source only — the single header has no optional machinery left to
+> trim; it already ships only what a freestanding bump allocator needs.
 
 Most of engram's optional machinery is opt-**out**: tracking counters, the save-point
 stack and PMR are all on by default. `ENGRAM_MINIMAL` is a single macro that turns the
@@ -1020,7 +1027,7 @@ applied to the `engram` target, so anything linking `engram::engram` inherits it
 
 | Option                     | Default | Effect                                                                    |
 | -------------------------- | ------- | ------------------------------------------------------------------------- |
-| `ENGRAM_SINGLE_HEADER`     | `ON`    | `ON` builds an INTERFACE target over `single_header/`; `OFF` compiles `src/engram.cpp` into a static library. |
+| `ENGRAM_SINGLE_HEADER`     | `OFF`   | `ON` builds an INTERFACE target over `single_header/` (freestanding-only); `OFF` compiles `src/engram.cpp` into a static library (full build). |
 | `ENGRAM_BUILD_TESTS`       | `OFF`   | Build the CppUTest suite and register it with CTest.                      |
 | `ENGRAM_ALL`               | `OFF`   | Turn on every backend available on the current platform.                  |
 | `ENGRAM_MINIMAL`           | `OFF`   | Trim to heap + the platform's native GPU backend; see [Build profiles](#build-profiles). |
@@ -1060,7 +1067,7 @@ can be set either way; the rest are compiler defines.
 | --------------------------- | ----------------------------------------------------------------------- |
 | `ENGRAM_MINIMAL`            | Heap + one native GPU backend, nothing else. Implies `ENGRAM_DISABLE_PMR`, `ENGRAM_DISABLE_TRACKING`, `ENGRAM_DISABLE_SAVE_RESTORE`, `ENGRAM_MASK_EXCEPTIONS`; switches `ENGRAM_EASY_POP` and the non-native backends off. |
 | `ENGRAM_ALL`                | The opposite: turn on every backend the platform supports.               |
-| `ENGRAM_ENABLE_FREESTANDING`| No OS, heap, PMR or vendor runtime. Single header only; auto-detected from `__STDC_HOSTED__ == 0`. |
+| `ENGRAM_ENABLE_FREESTANDING`| No OS, heap, PMR or vendor runtime. Always on in the single header; not available in the header + source build. |
 | `ENGRAM_ENABLE_FSEXTRA`     | Bring `warm_cache` back into a freestanding build.                       |
 
 **Features** — each one independently on or off.
@@ -1103,8 +1110,12 @@ cmake -S . -B build -DCMAKE_CXX_STANDARD=23
 ### Command line examples
 
 ```bash
-# Default: header-only, no backends.
+# Default: header + source, no backends.
 cmake -S . -B build
+cmake --build build
+
+# Single header: freestanding only, no build-system knobs apply to it.
+cmake -S . -B build -DENGRAM_SINGLE_HEADER=ON
 cmake --build build
 
 # Header + source, release build.
@@ -1133,7 +1144,7 @@ ctest --test-dir build --output-on-failure
 cmake -S . -B build -DENGRAM_ENABLE_CUDA=ON
 
 # Multi-config generators pick the configuration at build time.
-cmake -S . -B build -G "Visual Studio 17 2022" -DENGRAM_SINGLE_HEADER=OFF
+cmake -S . -B build -G "Visual Studio 17 2022"
 cmake --build build --config Release
 ```
 
@@ -1202,24 +1213,27 @@ ctest --test-dir build --output-on-failure
 ```
 
 Each file covers one build shape, and each is compiled directly against the
-sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested:
+sources it targets, so `ENGRAM_SINGLE_HEADER` does not affect what gets tested.
+The single header is freestanding-only, so it is covered solely by
+`test_freestanding.cpp`; every other suite targets the header + source build:
 
 | Test file                                                    | Build under test                                       |
 | ------------------------------------------------------------ | ------------------------------------------------------ |
 | [`tests/test_hcpp.cpp`](tests/test_hcpp.cpp)                 | `src/engram.h` + `src/engram.cpp` (PIMPL), built plain, with `ENGRAM_MASK_EXCEPTIONS`, with `ENGRAM_ENABLE_SOURCE_INFO`, with `ENGRAM_EASY_POP`, and once as C++23 |
-| [`tests/test_single_h.cpp`](tests/test_single_h.cpp)         | `single_header/engram.h`, same five configurations      |
-| [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h` with `ENGRAM_ENABLE_FREESTANDING`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
-| [`tests/test_profiles.cpp`](tests/test_profiles.cpp)         | Both layouts with `ENGRAM_DISABLE_SAVE_RESTORE`, and both again with `ENGRAM_MINIMAL` — four targets |
-| [`tests/test_vendor_linux.cpp`](tests/test_vendor_linux.cpp) | Both layouts against the real SDK headers for each Linux backend that could be resolved — compile-only |
+| [`tests/test_freestanding.cpp`](tests/test_freestanding.cpp) | `single_header/engram.h`, built twice — with and without `ENGRAM_ENABLE_FSEXTRA` |
+| [`tests/test_profiles.cpp`](tests/test_profiles.cpp)         | `src/engram.h` + `src/engram.cpp` with `ENGRAM_DISABLE_SAVE_RESTORE`, and again with `ENGRAM_MINIMAL` — two targets |
+| [`tests/test_vendor_linux.cpp`](tests/test_vendor_linux.cpp) | Header + source against the real SDK headers for each Linux backend that could be resolved — compile-only |
 
 #### Vendor conformance (Linux)
 
 The Linux device backends need hardware, a kernel module, or root to run, and their
 driver libraries are not linked, so they cannot be covered by ordinary tests. Instead
 [`tests/test_vendor_linux.cpp`](tests/test_vendor_linux.cpp) is compiled — never
-linked — once per backend as an `OBJECT` library. That still catches the failure mode
-that actually bites: engram's backend code drifting out of sync with a vendor header.
-A mismatch is a build failure, so it shows up in `cmake --build`, not in `ctest`.
+linked — once per backend as an `OBJECT` library, against the header + source
+build (the only layout vendor backends exist in). That still catches the failure
+mode that actually bites: engram's backend code drifting out of sync with a
+vendor header. A mismatch is a build failure, so it shows up in `cmake --build`,
+not in `ctest`.
 
 Headers already installed win; otherwise the header-only SDKs are fetched:
 
@@ -1259,9 +1273,7 @@ swallowed destructors under `ENGRAM_MASK_EXCEPTIONS`. The freestanding suite add
 `arena::unpin`, `arena::sync`) is genuinely gone. The profile suite does the same for
 `save` / `restore` / `save_depth` and PMR, checks that `ENGRAM_MINIMAL` really sets the
 macros it promises and keeps exactly one native backend, and re-runs the core
-allocation behaviour to prove the trimmed build still works. `test_single_h.cpp` uses
-CppUTestExt's mocking to stand up a fake backend and check that `create_custom`
-calls the allocator once and the free hook once, on destruction. Real vendor
+allocation behaviour to prove the trimmed build still works. Real vendor
 runtimes (CUDA, Vulkan, DX12, …) are out of scope — they need device handles no
 CI machine is guaranteed to have.
 

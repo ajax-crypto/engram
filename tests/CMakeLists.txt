@@ -61,22 +61,10 @@ engram_add_test(engram_test_hcpp
     DEFINES  ${ENGRAM_DEFINITIONS}
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
-engram_add_test(engram_test_single_h
-    SOURCES  test_single_h.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
-    DEFINES  ${ENGRAM_DEFINITIONS}
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
-# Same suites again with the exception-masking policy selected.
+# Same suite again with the exception-masking policy selected.
 engram_add_test(engram_test_hcpp_masked
     SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_MASK_EXCEPTIONS
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
-engram_add_test(engram_test_single_h_masked
-    SOURCES  test_single_h.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_MASK_EXCEPTIONS
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
@@ -87,22 +75,10 @@ engram_add_test(engram_test_hcpp_srcinfo
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_SOURCE_INFO
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
-engram_add_test(engram_test_single_h_srcinfo
-    SOURCES  test_single_h.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
-    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_SOURCE_INFO
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
 # And again with the untyped pop() enabled.
 engram_add_test(engram_test_hcpp_easypop
     SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
-engram_add_test(engram_test_single_h_easypop
-    SOURCES  test_single_h.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
@@ -114,21 +90,9 @@ engram_add_test(engram_test_hcpp_nosave
     DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_DISABLE_SAVE_RESTORE
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
-engram_add_test(engram_test_single_h_nosave
-    SOURCES  test_profiles.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
-    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_DISABLE_SAVE_RESTORE
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
 engram_add_test(engram_test_hcpp_minimal
     SOURCES  test_profiles.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    DEFINES  ENGRAM_MINIMAL
-    LIBS     ${ENGRAM_HOSTED_LIBS})
-
-engram_add_test(engram_test_single_h_minimal
-    SOURCES  test_profiles.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
     DEFINES  ENGRAM_MINIMAL
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
@@ -143,7 +107,7 @@ engram_add_test(engram_test_freestanding_fsextra
     DEFINES  ENGRAM_ENABLE_FREESTANDING ENGRAM_ENABLE_FSEXTRA)
 
 # push_md_array switches itself on when the standard library has <mdspan>, so the
-# only thing needed to cover it is a C++23 build of the same suites.
+# only thing needed to cover it is a C++23 build of the same suite.
 include(CheckIncludeFileCXX)
 set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX23_STANDARD_COMPILE_OPTION}")
 check_include_file_cxx(mdspan ENGRAM_HAVE_MDSPAN)
@@ -153,13 +117,6 @@ if(ENGRAM_HAVE_MDSPAN)
     engram_add_test(engram_test_hcpp_cxx23
         SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
         INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
-        DEFINES  ${ENGRAM_DEFINITIONS}
-        STANDARD cxx_std_23
-        LIBS     ${ENGRAM_HOSTED_LIBS})
-
-    engram_add_test(engram_test_single_h_cxx23
-        SOURCES  test_single_h.cpp
-        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
         DEFINES  ${ENGRAM_DEFINITIONS}
         STANDARD cxx_std_23
         LIBS     ${ENGRAM_HOSTED_LIBS})
@@ -274,6 +231,8 @@ if(UNIX AND NOT APPLE)
     endif()
 
     # Compiled, never linked: the driver symbols stay deliberately unresolved.
+    # Vendor backends only exist in the header + source build now that
+    # single_header/engram.h is freestanding-only.
     function(engram_add_vendor_conformance name)
         cmake_parse_arguments(ARG "" "" "SOURCES;INCLUDES;DEFINES" ${ARGN})
 
@@ -287,14 +246,6 @@ if(UNIX AND NOT APPLE)
     foreach(backend IN LISTS ENGRAM_VENDOR_BACKENDS)
         string(TOLOWER ${backend} lower)
 
-        engram_add_vendor_conformance(engram_vendor_single_h_${lower}
-            SOURCES  test_vendor_linux.cpp
-            INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
-                     ${ENGRAM_VENDOR_${backend}_INCLUDES}
-            DEFINES  ENGRAM_ENABLE_${backend} ENGRAM_SINGLE_HEADER_BUILD)
-
-        # The split build keeps its vendor code in engram.cpp, so compile that
-        # against the same headers rather than only the calling side.
         engram_add_vendor_conformance(engram_vendor_hcpp_${lower}
             SOURCES  test_vendor_linux.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
             INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src

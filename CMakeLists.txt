@@ -8,10 +8,13 @@ project(engram
 # ---------------------------------------------------------------------------
 # Build-shape options
 # ---------------------------------------------------------------------------
-# ON  -> header-only build using single_header/engram.h (INTERFACE library).
-# OFF -> split build using src/engram.h + src/engram.cpp (compiled library).
+# ON  -> header-only build using single_header/engram.h (INTERFACE library,
+#        freestanding-only: stack and adopted-external arenas, no heap, no
+#        vendor backends).
+# OFF -> split build using src/engram.h + src/engram.cpp (compiled library,
+#        full feature set: heap, PMR, and every vendor backend).
 option(ENGRAM_SINGLE_HEADER
-    "Use the single-header build. When OFF, compiles the src/ header+cpp version." ON)
+    "Use the single-header build. When OFF, compiles the src/ header+cpp version." OFF)
 
 # ---------------------------------------------------------------------------
 # Feature options
