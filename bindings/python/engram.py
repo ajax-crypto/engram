@@ -50,6 +50,7 @@ class Flag(IntFlag):
     NO_CLEAR = _flags.no_clear
     PIN_TO_PHYSICAL = _flags.pin_to_physical
     UNIFIED = _flags.unified
+    AVOID_FALSE_SHARING = _flags.avoid_false_sharing
 
 
 class IO(IntFlag):

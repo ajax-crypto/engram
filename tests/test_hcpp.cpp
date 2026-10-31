@@ -561,6 +561,63 @@ TEST(Allocation, ResetReclaimsEverythingAtOnce)
 }
 
 // ---------------------------------------------------------------------------
+// Contains
+// ---------------------------------------------------------------------------
+TEST_GROUP(Contains)
+{
+};
+
+TEST(Contains, NullptrIsNeverContained)
+{
+    auto a = arena::heap(4096);
+    CHECK_FALSE(a.contains(nullptr));
+}
+
+TEST(Contains, InvalidArenaContainsNothing)
+{
+    ENGRAM_STACK_ARENA(a, std::size_t{ 1 } << 40);
+    CHECK_FALSE(a.is_valid());
+    CHECK_FALSE(a.contains(nullptr));
+}
+
+TEST(Contains, BaseAndLastByteAreContained)
+{
+    auto a = arena::heap(4096);
+
+    CHECK_TRUE(a.contains(a.data().data()));
+    CHECK_TRUE(a.contains(a.data().data() + a.capacity() - 1));
+}
+
+TEST(Contains, OnePastTheEndIsNotContained)
+{
+    auto a = arena::heap(4096);
+    CHECK_FALSE(a.contains(a.data().data() + a.capacity()));
+}
+
+TEST(Contains, PointerBeforeTheBaseIsNotContained)
+{
+    auto a = arena::heap(4096);
+    CHECK_FALSE(a.contains(a.data().data() - 1));
+}
+
+TEST(Contains, PushedObjectIsContained)
+{
+    auto a = arena::heap(4096);
+    auto& value = a.push<int>(1);
+    CHECK_TRUE(a.contains(&value));
+}
+
+TEST(Contains, PartitionPointerIsContainedInBothArenas)
+{
+    auto parent = arena::heap(4096);
+    auto sub = parent.partition(1024, 512);
+
+    CHECK_TRUE(parent.contains(sub.data().data()));
+    CHECK_TRUE(sub.contains(sub.data().data()));
+    CHECK_FALSE(sub.contains(parent.data().data()));
+}
+
+// ---------------------------------------------------------------------------
 // Partitions (sub-arenas)
 // ---------------------------------------------------------------------------
 TEST_GROUP(Partition)
@@ -649,6 +706,52 @@ TEST(Partition, SiblingsAreIndependent)
     UNSIGNED_LONGS_EQUAL(128u, right.used());
     CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
+}
+
+TEST(Partition, AvoidFalseSharingKeepsTheRequestedCapacity)
+{
+    auto parent = arena::heap(4096);
+
+    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+
+    UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
+    POINTERS_EQUAL(parent.data().data() + 1024, sub.data().data());
+}
+
+TEST(Partition, AvoidFalseSharingReservesSizePlusPadInTheParent)
+{
+    auto parent = arena::heap(4096);
+
+    auto guarded = parent.partition(0, 512, flags::avoid_false_sharing);
+    auto next = parent.partition(512 + ENGRAM_FALSE_SHARING_PAD, 64);
+
+    auto gs = guarded.push_array<std::byte>(guarded.capacity());
+    auto ns = next.push_array<std::byte>(64);
+
+    // The pad keeps `next`'s storage ENGRAM_FALSE_SHARING_PAD bytes away from
+    // whatever `guarded` actually uses.
+    CHECK_TRUE((ns.data() - (gs.data() + gs.size())) >= ENGRAM_FALSE_SHARING_PAD);
+}
+
+TEST(Partition, AvoidFalseSharingZeroesTheGuardBytesToo)
+{
+    auto parent = arena::heap(4096);
+    fill(parent.data(), 0xEE);
+
+    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+
+    CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
+    CHECK_TRUE(all_equal(parent.data().data() + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0x00));
+}
+
+TEST(Partition, AvoidFalseSharingWithNoClearKeepsTheExistingBytes)
+{
+    auto parent = arena::heap(4096);
+    fill(parent.data(), 0xEE);
+
+    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing | flags::no_clear);
+
+    CHECK_TRUE(all_equal(parent.data().data() + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0xEE));
 }
 
 // ---------------------------------------------------------------------------

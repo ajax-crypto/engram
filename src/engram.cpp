@@ -1153,11 +1153,32 @@ std::span<std::byte> arena::data() const noexcept
     return { m_impl->m_ptr, m_impl->m_size };
 }
 
+bool arena::contains(const void* ptr) const noexcept
+{
+    if (!m_impl || !m_impl->m_ptr || !ptr)
+        return false;
+    auto p = reinterpret_cast<const std::byte*>(ptr);
+    return p >= m_impl->m_ptr && p < m_impl->m_ptr + m_impl->m_size;
+}
+
 arena arena::partition(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
     auto& d = *m_impl;
-    assert((start + size) <= d.m_size);
-    return make_external(d.m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit ENGRAM_SOURCE_ARG);
+
+    // avoid_false_sharing reserves ENGRAM_FALSE_SHARING_PAD extra bytes beyond
+    // `size` in the parent as an unused guard; the sub-arena's capacity is still
+    // exactly `size`.
+    auto reserved = size;
+    if (flags & engram::flags::avoid_false_sharing)
+        reserved += ENGRAM_FALSE_SHARING_PAD;
+    assert((start + reserved) <= d.m_size);
+
+    // Zero the whole reserved region (guard bytes included) up front, then hand
+    // back an external view sized to just the requested bytes.
+    if (!(flags & engram::flags::no_clear))
+        memset(d.m_ptr + start, 0, reserved);
+
+    return make_external(d.m_ptr + start, size, engram::flags::no_clear ENGRAM_SOURCE_ARG);
 }
 
 arena::~arena()

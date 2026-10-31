@@ -56,6 +56,11 @@
 #define ENGRAM_CACHELINE_SZ 64
 #endif
 
+/** @brief Bytes reserved as a trailing guard by `flags::avoid_false_sharing` in @ref engram::arena::partition. */
+#ifndef ENGRAM_FALSE_SHARING_PAD
+#define ENGRAM_FALSE_SHARING_PAD 128
+#endif
+
 /** @brief Taken when an unrecoverable misuse is detected; must not return. */
 #ifndef ENGRAM_ABORT
 #define ENGRAM_ABORT() abort()
@@ -199,6 +204,11 @@ namespace flags
     /// `VirtualAlloc(MEM_RESERVE)`); the range is inaccessible until the caller commits a
     /// sub-range through platform-specific means.
     constexpr int32_t reserve_only = 256;
+    /// `arena::partition` only: additionally reserve a trailing `ENGRAM_FALSE_SHARING_PAD`-byte
+    /// buffer right after the requested region, so the real span taken from the parent is
+    /// `size + ENGRAM_FALSE_SHARING_PAD` bytes while the sub-arena's capacity stays `size`;
+    /// adjacent partitions never share a cache line.
+    constexpr int32_t avoid_false_sharing = 512;
 
     constexpr int32_t read = 1;              ///< Cache-warm read intent (@ref warm_cache ioflags).
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).
@@ -1002,6 +1012,19 @@ public:
     }
 
     /**
+     * @brief Check whether @p ptr falls within this arena's storage.
+     * @param ptr Pointer to test; `nullptr` always returns `false`.
+     * @return `true` if @p ptr lies in `[data().data(), data().data() + capacity())`.
+     */
+    bool contains(const void* ptr) const noexcept
+    {
+        if (!m_ptr || !ptr)
+            return false;
+        auto p = reinterpret_cast<const std::byte*>(ptr);
+        return p >= m_ptr && p < m_ptr + m_size;
+    }
+
+    /**
      * @brief Carve out a sub-arena over a fixed region of this arena's storage.
      *
      * @details The returned arena is a @ref memory_source::external view of
@@ -1012,13 +1035,30 @@ public:
      * @param start Byte offset of the region within this arena.
      * @param size  Size of the region in bytes.
      * @param flags @ref flags controlling initialisation: the region is zeroed by
-     *              default (and with `commit`); pass `no_clear` to skip zeroing.
+     *              default (and with `commit`); pass `no_clear` to skip zeroing. Pass
+     *              `avoid_false_sharing` to additionally reserve `ENGRAM_FALSE_SHARING_PAD`
+     *              bytes right after `[start, start + size)` as an unused guard — the real
+     *              region taken from the parent is `size + ENGRAM_FALSE_SHARING_PAD` bytes,
+     *              but the sub-arena's capacity is still exactly `size`, so it never shares
+     *              a cache line with whatever follows it in the parent.
      * @return A sub-arena bound to `[start, start + size)`.
      */
     [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
     {
-        assert((start + size) <= m_size);
-        return adopt(m_ptr + start, size, (flags & engram::flags::no_clear) ? 0 : engram::flags::commit ENGRAM_SOURCE_ARG);
+        // avoid_false_sharing reserves ENGRAM_FALSE_SHARING_PAD extra bytes beyond
+        // `size` in the parent as an unused guard; the sub-arena's capacity is
+        // still exactly `size`.
+        auto reserved = size;
+        if (flags & engram::flags::avoid_false_sharing)
+            reserved += ENGRAM_FALSE_SHARING_PAD;
+        assert((start + reserved) <= m_size);
+
+        // Zero the whole reserved region (guard bytes included) up front, then
+        // hand back a view sized to just the requested bytes.
+        if (!(flags & engram::flags::no_clear))
+            memset(m_ptr + start, 0, reserved);
+
+        return adopt(m_ptr + start, size, engram::flags::no_clear ENGRAM_SOURCE_ARG);
     }
 };
 

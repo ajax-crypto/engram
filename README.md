@@ -2,8 +2,9 @@
 
 A C++20 library that provides a unified arena-allocation API over a
 variety of memory targets — stack, heap, external buffers, and GPU / accelerator
-device memory. It ships in **two interchangeable layouts** — a drop-in single
-header and a header + source (`.h`/`.cpp`) pair — see
+device memory. It ships as **two separate artifacts with different scopes** : a full, hosted header +
+source (`.h`/`.cpp`) build, and a **freestanding-only** single header for
+targets with no OS or heap. See
 [Choosing a layout](#choosing-a-layout-single-header-vs-header--source).
 
 ## TL;DR
@@ -26,6 +27,11 @@ auto  hello = a.push_string("hi");          // std::string_view
 
 a.pop_string(hello);                        // LIFO unwind (or just let `a` die)
 ```
+
+> This example uses `arena::heap`, part of the full header + source build. The
+> single header is freestanding-only (stack/external arenas only) — it is not
+> a drop-in alternative for this snippet. See
+> [Freestanding single header](#freestanding-single-header).
 
 With `engram` you can:
 
@@ -56,7 +62,7 @@ different scopes, not the same API: the single header is freestanding-only
 hosted build (adds heap, PMR, and every vendor backend).
 
 ```cpp
-#include "engram.h"     // single_header/engram.h  — or  src/engram.h
+#include "engram.h"     // single_header/engram.h (freestanding only) — or — src/engram.h (full build)
 using namespace engram;
 ```
 
@@ -239,6 +245,7 @@ Behavior is tuned with the `int32_t` constants in the `engram::flags` namespace
 | `flags::no_clear`        | Don't zero the memory when the arena is freed.      |
 | `flags::pin_to_physical` | Lock the pages into RAM (`mlock` / `VirtualLock`).  |
 | `flags::unified`         | Unified / shareable memory: `memfd` on the Linux heap; managed memory (`cudaMallocManaged` / `hipMallocManaged`) for CUDA / ROCm. |
+| `flags::avoid_false_sharing` | `arena::partition` only: additionally reserve `ENGRAM_FALSE_SHARING_PAD` bytes beyond `size`, unused, so adjacent partitions can't share a cache line — see [Partitioning](#partitioning-sub-arenas). |
 
 By default an arena scrubs (zeroes) its memory when it is destroyed; pass
 `flags::no_clear` to skip that.
@@ -397,12 +404,20 @@ a.source();     // the memory_source backing this arena
 a.error();      // the arena_error recorded during creation
 a.origin();     // where it was created (with ENGRAM_ENABLE_SOURCE_INFO)
 a.data();       // std::span<std::byte> over the whole storage [base, capacity)
+a.contains(ptr);// true if ptr falls within [data().data(), data().data() + capacity())
 a.unpin();      // undo flags::pin_to_physical (munlock / VirtualUnlock)
 ```
 
 `count()` and `total()` are maintained by lightweight per-allocation counters.
 Define `ENGRAM_DISABLE_TRACKING` to drop those counters (and the two `std::size_t`
 fields backing them) entirely; both accessors then always return `0`.
+
+`contains(ptr)` checks whether `ptr` lies within this arena's own storage —
+useful for routing a pointer back to the sub-arena (see [Partitioning](#partitioning-sub-arenas))
+that owns it, or for asserting that a pointer a caller handed back actually came
+from this arena. It is bounds-only: it does not check alignment or that `ptr`
+lands on an allocation boundary. `nullptr` and an arena with no storage (`!is_valid()`)
+always return `false`.
 
 > `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
@@ -478,17 +493,31 @@ size)`; destroying it leaves the parent (and its memory) untouched, so no extra
 allocation or ownership transfer is involved. The region is zeroed by default;
 pass `flags::no_clear` to skip that. You pick the (non-overlapping) regions.
 
+Adjacent sub-arenas used by different threads can suffer **false sharing**: if
+one thread's bytes and the next thread's bytes land on the same CPU cache line,
+writes to one bounce the line out of the other core's cache even though the
+threads never touch each other's data. Pass `flags::avoid_false_sharing` to
+guard against that — it additionally reserves `ENGRAM_FALSE_SHARING_PAD`
+(default 128) bytes right after `[start, start + size)` as unused padding, so
+the real region taken from the parent is `size + ENGRAM_FALSE_SHARING_PAD`
+bytes while the sub-arena's `capacity()` stays exactly `size`. Because the pad
+is extra, not carved out of `size`, the **stride** between partitions — not
+just their requested size — has to grow by the pad to keep them apart:
+
 ```cpp
 auto pool = arena::heap(4 << 20);              // 4 MiB backing block
 
 // Split the pool into per-worker slices and run them in parallel.
 constexpr std::size_t workers = 4;
-const std::size_t slice = pool.capacity() / workers;
+const std::size_t stride = pool.capacity() / workers;
+const std::size_t slice = stride - ENGRAM_FALSE_SHARING_PAD;   // + the pad == stride
 
 std::vector<std::thread> threads;
 for (std::size_t i = 0; i < workers; ++i)
 {
-    engram::arena sub = pool.partition(i * slice, slice);   // slice is zeroed
+    // Each worker's real span is `slice + ENGRAM_FALSE_SHARING_PAD` == stride
+    // bytes, so consecutive workers never share a cache line.
+    engram::arena sub = pool.partition(i * stride, slice, engram::flags::avoid_false_sharing);
     threads.emplace_back([sub = std::move(sub)]() mutable {
         auto scratch = sub.push_array<float>(256);   // each thread bump-allocates
         // ... work only within this thread's slice ...
@@ -952,13 +981,12 @@ your target's stack budget. Oversized requests report
 
 Cache warming lowers to a plain CPU instruction and needs no OS, but it is off by
 default in freestanding builds so the generated code stays minimal. Define
-`ENGRAM_ENABLE_FSEXTRA` alongside `ENGRAM_ENABLE_FREESTANDING` to bring back the
+`ENGRAM_ENABLE_FSEXTRA` before including the single header to bring back the
 free `engram::warm_cache` and both `arena::warm_cache` overloads:
 
 ```cpp
-#define ENGRAM_ENABLE_FREESTANDING
 #define ENGRAM_ENABLE_FSEXTRA
-#include "engram.h"
+#include "engram.h"   // single_header/engram.h
 ```
 
 `engram::prefetch` stays out even with `ENGRAM_ENABLE_FSEXTRA` — it is a request
@@ -1091,6 +1119,7 @@ can be set either way; the rest are compiler defines.
 | `ENGRAM_FREESTANDING_STACKSZ`| `65536`   | Stack budget `ENGRAM_STACK_ARENA` is checked against when there is no OS to ask. |
 | `ENGRAM_FALLBACK_PAGESZ`     | `4096`    | Page size assumed when the OS query fails.                   |
 | `ENGRAM_CACHELINE_SZ`        | `64`      | Bytes covered per prefetch instruction in `warm_cache`.      |
+| `ENGRAM_FALSE_SHARING_PAD`   | `128`     | Extra bytes `arena::partition` reserves beyond `size` under `flags::avoid_false_sharing`. |
 | `ENGRAM_ABORT()`             | `abort()` | Taken on unrecoverable misuse (an exhausted `push<T>`). Must not return. |
 
 **Backends** — `ENGRAM_ENABLE_VULKAN`, `_DX12`, `_CUDA`, `_ROCM`, `_XDNA`, `_OPENCL`,
@@ -1308,6 +1337,7 @@ del scratch                                     # drop views before rewinding
 a.restore()                                     # scratch is reclaimed and zeroed
 
 print(a.used, a.capacity, a.remaining, a.source)
+print(a.contains(mv))                           # True: mv points into a's storage
 
 # adopt a buffer you already own (the arena will not free it)
 buf = bytearray(4096)
@@ -1322,9 +1352,9 @@ What's exposed: the `Arena` factories (`create`, `heap`, `adopt`, plus `named_he
 and `heapfile` on Linux), byte allocation (`alloc`, `push_bytes`, `push_str`,
 `pop_bytes`, `pop_str`, `partition`), scoped rewind (`save`, `restore`,
 `save_depth`), introspection (`used`, `capacity`, `remaining`, `count`, `total`,
-`source`, `error`, `data`, `is_valid`, `empty`), `prefetch` / `warm_cache` / `sync` /
-`reset` / `unpin`, the `MemorySource`, `CacheLocality`, and `ArenaError` enums, and
-`Flag` / `IO` flag sets.
+`source`, `error`, `data`, `contains`, `is_valid`, `empty`), `prefetch` / `warm_cache` /
+`sync` / `reset` / `unpin`, the `MemorySource`, `CacheLocality`, and `ArenaError`
+enums, and `Flag` / `IO` flag sets.
 
 Factories never raise on failure, matching the C++ API — check `error` (or
 `is_valid()`) after creating an arena:

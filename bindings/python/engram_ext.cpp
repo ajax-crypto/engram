@@ -84,6 +84,7 @@ PYBIND11_MODULE(_engram, m)
     flags.attr("unified") = static_cast<int>(engram::flags::unified);
     flags.attr("read") = static_cast<int>(engram::flags::read);
     flags.attr("write") = static_cast<int>(engram::flags::write);
+    flags.attr("avoid_false_sharing") = static_cast<int>(engram::flags::avoid_false_sharing);
 
     py::class_<arena>(m, "Arena")
         // ---- factories -----------------------------------------------------
@@ -187,7 +188,18 @@ PYBIND11_MODULE(_engram, m)
             },
             py::arg("start"), py::arg("size"), py::arg("flags") = 0, py::keep_alive<0, 1>(),
             "Create a non-owning sub-arena over [start, start+size) of this arena (zeroed by "
-            "default; pass flags.no_clear to skip). The parent is kept alive while the sub-arena lives.")
+            "default; pass flags.no_clear to skip). Pass flags.avoid_false_sharing to additionally "
+            "reserve ENGRAM_FALSE_SHARING_PAD unused bytes right after size, so the real span taken "
+            "from the parent is size + ENGRAM_FALSE_SHARING_PAD while the sub-arena's capacity stays "
+            "size. The parent is kept alive while the sub-arena lives.")
+        .def(
+            "contains",
+            [](const arena& a, py::buffer view) {
+                return a.contains(view.request().ptr);
+            },
+            py::arg("view"),
+            "Check whether a buffer/memoryview (e.g. one returned by alloc/push_bytes/push_str/"
+            "partition.data) points into this arena's storage.")
 
         // ---- prefetch / cache ---------------------------------------------
         .def(

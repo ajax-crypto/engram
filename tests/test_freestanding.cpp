@@ -369,6 +369,58 @@ TEST(FreestandingAllocation, ResetReclaimsEverythingAtOnce)
 }
 
 // ---------------------------------------------------------------------------
+// Contains
+// ---------------------------------------------------------------------------
+TEST_GROUP(FreestandingContains)
+{
+    void setup() override { std::memset(g_pool, 0, sizeof(g_pool)); }
+};
+
+TEST(FreestandingContains, NullptrIsNeverContained)
+{
+    auto a = make_pool_arena();
+    CHECK_FALSE(a.contains(nullptr));
+}
+
+TEST(FreestandingContains, InvalidArenaContainsNothing)
+{
+    ENGRAM_STACK_ARENA(a, std::size_t{ ENGRAM_FREESTANDING_STACKSZ } * 2);
+    CHECK_FALSE(a.is_valid());
+    CHECK_FALSE(a.contains(nullptr));
+}
+
+TEST(FreestandingContains, BaseAndLastByteAreContained)
+{
+    auto a = make_pool_arena();
+
+    CHECK_TRUE(a.contains(a.data().data()));
+    CHECK_TRUE(a.contains(a.data().data() + a.capacity() - 1));
+}
+
+TEST(FreestandingContains, OnePastTheEndIsNotContained)
+{
+    auto a = make_pool_arena();
+    CHECK_FALSE(a.contains(a.data().data() + a.capacity()));
+}
+
+TEST(FreestandingContains, PushedObjectIsContained)
+{
+    auto a = make_pool_arena();
+    auto& value = a.push<int>(1);
+    CHECK_TRUE(a.contains(&value));
+}
+
+TEST(FreestandingContains, PartitionPointerIsContainedInBothArenas)
+{
+    auto parent = make_pool_arena();
+    auto sub = parent.partition(1024, 512);
+
+    CHECK_TRUE(parent.contains(sub.data().data()));
+    CHECK_TRUE(sub.contains(sub.data().data()));
+    CHECK_FALSE(sub.contains(parent.data().data()));
+}
+
+// ---------------------------------------------------------------------------
 // Partitions
 // ---------------------------------------------------------------------------
 TEST_GROUP(FreestandingPartition)
@@ -439,6 +491,26 @@ TEST(FreestandingPartition, SiblingsAreIndependent)
     UNSIGNED_LONGS_EQUAL(128u, right.used());
     CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
+}
+
+TEST(FreestandingPartition, AvoidFalseSharingKeepsTheRequestedCapacity)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+
+    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+
+    UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
+    POINTERS_EQUAL(g_pool + 1024, sub.data().data());
+}
+
+TEST(FreestandingPartition, AvoidFalseSharingZeroesTheGuardBytesToo)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+
+    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+
+    CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
+    CHECK_TRUE(all_equal(g_pool + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0x00));
 }
 
 // ---------------------------------------------------------------------------
