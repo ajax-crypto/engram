@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include <CppUTest/CommandLineTestRunner.h>
 #include <CppUTest/TestHarness.h>
@@ -607,10 +608,10 @@ TEST(Contains, PushedObjectIsContained)
     CHECK_TRUE(a.contains(&value));
 }
 
-TEST(Contains, PartitionPointerIsContainedInBothArenas)
+TEST(Contains, SlicePointerIsContainedInBothArenas)
 {
     auto parent = arena::heap(4096);
-    auto sub = parent.partition(1024, 512);
+    auto sub = parent.slice(1024, 512);
 
     CHECK_TRUE(parent.contains(sub.data().data()));
     CHECK_TRUE(sub.contains(sub.data().data()));
@@ -618,31 +619,31 @@ TEST(Contains, PartitionPointerIsContainedInBothArenas)
 }
 
 // ---------------------------------------------------------------------------
-// Partitions (sub-arenas)
+// Slices (sub-arenas)
 // ---------------------------------------------------------------------------
-TEST_GROUP(Partition)
+TEST_GROUP(Slice)
 {
 };
 
-TEST(Partition, IsAnExternalViewOfTheParent)
+TEST(Slice, IsAnExternalViewOfTheParent)
 {
     auto parent = arena::heap(4096);
 
-    auto sub = parent.partition(1024, 512);
+    auto sub = parent.slice(1024, 512);
 
     LONGS_EQUAL((long)memory_source::external, (long)sub.source());
     UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
     POINTERS_EQUAL(parent.data().data() + 1024, sub.data().data());
 }
 
-TEST(Partition, DoesNotDisturbTheParentOffset)
+TEST(Slice, DoesNotDisturbTheParentOffset)
 {
     auto parent = arena::heap(4096);
     auto& anchor = parent.push<int>(1);
     (void)anchor;
     auto used = parent.used();
 
-    auto sub = parent.partition(2048, 512);
+    auto sub = parent.slice(2048, 512);
     auto span = sub.push_array<int>(16);
     (void)span;
 
@@ -650,12 +651,12 @@ TEST(Partition, DoesNotDisturbTheParentOffset)
     UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int)), sub.used());
 }
 
-TEST(Partition, IsZeroedByDefault)
+TEST(Slice, IsZeroedByDefault)
 {
     auto parent = arena::heap(4096);
     fill(parent.data(), 0xEE);
 
-    auto sub = parent.partition(1024, 256);
+    auto sub = parent.slice(1024, 256);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
     // Bytes outside the region are left as they were.
@@ -663,23 +664,23 @@ TEST(Partition, IsZeroedByDefault)
     CHECK_TRUE(all_equal(parent.data().data() + 1280, 256, 0xEE));
 }
 
-TEST(Partition, NoClearKeepsTheExistingBytes)
+TEST(Slice, NoClearKeepsTheExistingBytes)
 {
     auto parent = arena::heap(4096);
     fill(parent.data(), 0xEE);
 
-    auto sub = parent.partition(1024, 256, flags::no_clear);
+    auto sub = parent.slice(1024, 256, flags::no_clear);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0xEE));
 }
 
-TEST(Partition, DestroyingItLeavesTheParentIntact)
+TEST(Slice, DestroyingItLeavesTheParentIntact)
 {
     auto parent = arena::heap(4096);
     auto& anchor = parent.push<int>(99);
 
     {
-        auto sub = parent.partition(2048, 256);
+        auto sub = parent.slice(2048, 256);
         auto span = sub.push_array<int>(8);
         (void)span;
     }
@@ -689,12 +690,12 @@ TEST(Partition, DestroyingItLeavesTheParentIntact)
     UNSIGNED_LONGS_EQUAL(aligned(sizeof(int)), parent.used());
 }
 
-TEST(Partition, SiblingsAreIndependent)
+TEST(Slice, SiblingsAreIndependent)
 {
     auto parent = arena::heap(4096);
 
-    auto left = parent.partition(0, 1024);
-    auto right = parent.partition(2048, 1024);
+    auto left = parent.slice(0, 1024);
+    auto right = parent.slice(2048, 1024);
 
     auto ls = left.push_array<std::byte>(64);
     auto rs = right.push_array<std::byte>(128);
@@ -708,22 +709,22 @@ TEST(Partition, SiblingsAreIndependent)
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
 }
 
-TEST(Partition, AvoidFalseSharingKeepsTheRequestedCapacity)
+TEST(Slice, AvoidFalseSharingKeepsTheRequestedCapacity)
 {
     auto parent = arena::heap(4096);
 
-    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+    auto sub = parent.slice(1024, 512, flags::avoid_false_sharing);
 
     UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
     POINTERS_EQUAL(parent.data().data() + 1024, sub.data().data());
 }
 
-TEST(Partition, AvoidFalseSharingReservesSizePlusPadInTheParent)
+TEST(Slice, AvoidFalseSharingReservesSizePlusPadInTheParent)
 {
     auto parent = arena::heap(4096);
 
-    auto guarded = parent.partition(0, 512, flags::avoid_false_sharing);
-    auto next = parent.partition(512 + ENGRAM_FALSE_SHARING_PAD, 64);
+    auto guarded = parent.slice(0, 512, flags::avoid_false_sharing);
+    auto next = parent.slice(512 + ENGRAM_FALSE_SHARING_PAD, 64);
 
     auto gs = guarded.push_array<std::byte>(guarded.capacity());
     auto ns = next.push_array<std::byte>(64);
@@ -733,25 +734,139 @@ TEST(Partition, AvoidFalseSharingReservesSizePlusPadInTheParent)
     CHECK_TRUE((ns.data() - (gs.data() + gs.size())) >= ENGRAM_FALSE_SHARING_PAD);
 }
 
-TEST(Partition, AvoidFalseSharingZeroesTheGuardBytesToo)
+TEST(Slice, AvoidFalseSharingZeroesTheGuardBytesToo)
 {
     auto parent = arena::heap(4096);
     fill(parent.data(), 0xEE);
 
-    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+    auto sub = parent.slice(1024, 512, flags::avoid_false_sharing);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
     CHECK_TRUE(all_equal(parent.data().data() + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0x00));
 }
 
-TEST(Partition, AvoidFalseSharingWithNoClearKeepsTheExistingBytes)
+TEST(Slice, AvoidFalseSharingWithNoClearKeepsTheExistingBytes)
 {
     auto parent = arena::heap(4096);
     fill(parent.data(), 0xEE);
 
-    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing | flags::no_clear);
+    auto sub = parent.slice(1024, 512, flags::avoid_false_sharing | flags::no_clear);
 
     CHECK_TRUE(all_equal(parent.data().data() + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0xEE));
+}
+
+// ---------------------------------------------------------------------------
+// Partitioning (bulk slicing via callback)
+// ---------------------------------------------------------------------------
+TEST_GROUP(Partition)
+{
+};
+
+TEST(Partition, CallsFuncOnceForEachSizeInOrder)
+{
+    auto parent = arena::heap(4096);
+    std::size_t sizes[] = { 256, 512, 128 };
+    std::vector<arena> subs;
+
+    auto ok = parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); });
+
+    CHECK_TRUE(ok);
+    UNSIGNED_LONGS_EQUAL(3u, subs.size());
+    UNSIGNED_LONGS_EQUAL(256u, subs[0].capacity());
+    UNSIGNED_LONGS_EQUAL(512u, subs[1].capacity());
+    UNSIGNED_LONGS_EQUAL(128u, subs[2].capacity());
+    POINTERS_EQUAL(parent.data().data(), subs[0].data().data());
+    POINTERS_EQUAL(parent.data().data() + 256, subs[1].data().data());
+    POINTERS_EQUAL(parent.data().data() + 256 + 512, subs[2].data().data());
+}
+
+TEST(Partition, IsZeroedByDefault)
+{
+    auto parent = arena::heap(4096);
+    fill(parent.data(), 0xEE);
+    std::size_t sizes[] = { 256, 512 };
+    std::vector<arena> subs;
+
+    parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); });
+
+    CHECK_TRUE(all_equal(subs[0].data().data(), subs[0].data().size(), 0x00));
+    CHECK_TRUE(all_equal(subs[1].data().data(), subs[1].data().size(), 0x00));
+    // Bytes past the requested regions are left as they were.
+    CHECK_TRUE(all_equal(parent.data().data() + 256 + 512, 64, 0xEE));
+}
+
+TEST(Partition, NoClearKeepsTheExistingBytes)
+{
+    auto parent = arena::heap(4096);
+    fill(parent.data(), 0xEE);
+    std::size_t sizes[] = { 256, 512 };
+    std::vector<arena> subs;
+
+    parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); }, flags::no_clear);
+
+    CHECK_TRUE(all_equal(subs[0].data().data(), subs[0].data().size(), 0xEE));
+    CHECK_TRUE(all_equal(subs[1].data().data(), subs[1].data().size(), 0xEE));
+}
+
+TEST(Partition, AvoidFalseSharingSpacesSlicesApart)
+{
+    auto parent = arena::heap(4096);
+    std::size_t sizes[] = { 256, 512 };
+    std::vector<arena> subs;
+
+    auto ok = parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); },
+        flags::avoid_false_sharing);
+
+    CHECK_TRUE(ok);
+    UNSIGNED_LONGS_EQUAL(256u, subs[0].capacity());
+    UNSIGNED_LONGS_EQUAL(512u, subs[1].capacity());
+    POINTERS_EQUAL(parent.data().data() + 256 + ENGRAM_FALSE_SHARING_PAD, subs[1].data().data());
+}
+
+TEST(Partition, SiblingsAreIndependent)
+{
+    auto parent = arena::heap(4096);
+    std::size_t sizes[] = { 64, 128 };
+    std::vector<arena> subs;
+
+    parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); });
+
+    auto ls = subs[0].push_array<std::byte>(64);
+    auto rs = subs[1].push_array<std::byte>(128);
+
+    std::memset(ls.data(), 0x11, ls.size());
+    std::memset(rs.data(), 0x22, rs.size());
+
+    CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
+    CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
+}
+
+TEST(Partition, ReturnsFalseAndSkipsFuncWhenItDoesNotFit)
+{
+    auto parent = arena::heap(4096);
+    std::size_t sizes[] = { 2048, 4096 };
+    int calls = 0;
+
+    auto ok = parent.partition(sizes, [&](arena&&) { ++calls; });
+
+    CHECK_FALSE(ok);
+    LONGS_EQUAL(0, calls);
+}
+
+TEST(Partition, AvoidFalseSharingPaddingCanTipItOverTheEdge)
+{
+    // Fits without the pad, but the pad for each of the two slices pushes it over.
+    // arena::heap() page-aligns (rounds up) its request, so adopt a fixed-size
+    // buffer instead to keep the parent's capacity exact.
+    alignas(std::max_align_t) std::byte buf[2 * ENGRAM_FALSE_SHARING_PAD];
+    auto parent = arena::adopt(buf, sizeof(buf));
+    std::size_t sizes[] = { ENGRAM_FALSE_SHARING_PAD, ENGRAM_FALSE_SHARING_PAD };
+    int calls = 0;
+
+    auto ok = parent.partition(sizes, [&](arena&&) { ++calls; }, flags::avoid_false_sharing);
+
+    CHECK_FALSE(ok);
+    LONGS_EQUAL(0, calls);
 }
 
 // ---------------------------------------------------------------------------
@@ -886,10 +1001,10 @@ TEST(SaveRestore, ResetDropsPendingSavePoints)
     CHECK_FALSE(a.restore());
 }
 
-TEST(SaveRestore, WorksOnAPartition)
+TEST(SaveRestore, WorksOnASlice)
 {
     auto parent = arena::heap(4096);
-    auto sub = parent.partition(1024, 1024);
+    auto sub = parent.slice(1024, 1024);
 
     sub.save();
     auto span = sub.push_array<int>(32);
@@ -1304,12 +1419,12 @@ TEST(SourceInfo, OversizedStackArenaStillRecordsWhereItWasAsked)
     UNSIGNED_LONGS_EQUAL(here.line() + 1, a.origin().line());
 }
 
-TEST(SourceInfo, PartitionRecordsItsOwnCallSite)
+TEST(SourceInfo, SliceRecordsItsOwnCallSite)
 {
     auto parent = arena::heap(4096);
 
     const auto here = std::source_location::current();
-    auto sub = parent.partition(0, 512);
+    auto sub = parent.slice(0, 512);
 
     UNSIGNED_LONGS_EQUAL(here.line() + 1, sub.origin().line());
     CHECK_TRUE(sub.origin().line() != parent.origin().line());
@@ -1493,10 +1608,10 @@ TEST(EasyPop, RecordStackIsBounded)
     UNSIGNED_LONGS_EQUAL(0u, a.used());
 }
 
-TEST(EasyPop, WorksOnAPartition)
+TEST(EasyPop, WorksOnASlice)
 {
     auto parent = arena::heap(4096);
-    auto sub = parent.partition(1024, 1024);
+    auto sub = parent.slice(1024, 1024);
 
     auto span = sub.push_array<int>(16);
     (void)span;

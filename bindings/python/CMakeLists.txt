@@ -45,7 +45,8 @@ endif()
 # or CMake option of its own. Link the corresponding system libraries — no
 # third-party SDK is required for either.
 if(WIN32)
-    target_link_libraries(_engram PRIVATE d3d12 dxgi d3dcompiler)
+    # The heap backend reaches for VirtualAlloc2 and the token APIs (onecore / advapi32).
+    target_link_libraries(_engram PRIVATE d3d12 dxgi d3dcompiler advapi32 onecore)
 elseif(APPLE)
     target_compile_definitions(_engram PRIVATE ENGRAM_ENABLE_METAL)
     target_link_libraries(_engram PRIVATE

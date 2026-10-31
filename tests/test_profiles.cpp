@@ -183,10 +183,10 @@ TEST(TrimmedProfile, ResetStillRewinds)
     CHECK_TRUE(a.empty());
 }
 
-TEST(TrimmedProfile, PartitionsStillWork)
+TEST(TrimmedProfile, SlicesStillWork)
 {
     auto parent = arena::heap(4096);
-    auto sub = parent.partition(0, 1024);
+    auto sub = parent.slice(0, 1024);
 
     CHECK_TRUE(sub.is_valid());
     LONGS_EQUAL((long)memory_source::external, (long)sub.source());

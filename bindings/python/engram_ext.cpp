@@ -15,11 +15,13 @@
 #endif
 
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include <cstddef>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "engram.h"
 
@@ -182,9 +184,9 @@ PYBIND11_MODULE(_engram, m)
             "Release a string pushed with push_str. Pass the original str, or its length "
             "in bytes; the trailing NUL is accounted for automatically.")
         .def(
-            "partition",
+            "slice",
             [](arena& a, std::size_t start, std::size_t size, int flags) {
-                return a.partition(start, size, flags);
+                return a.slice(start, size, flags);
             },
             py::arg("start"), py::arg("size"), py::arg("flags") = 0, py::keep_alive<0, 1>(),
             "Create a non-owning sub-arena over [start, start+size) of this arena (zeroed by "
@@ -193,13 +195,24 @@ PYBIND11_MODULE(_engram, m)
             "from the parent is size + ENGRAM_FALSE_SHARING_PAD while the sub-arena's capacity stays "
             "size. The parent is kept alive while the sub-arena lives.")
         .def(
+            "partition",
+            [](arena& a, std::vector<std::size_t> sizes, py::function func, int flags) {
+                return a.partition(sizes, [&](arena&& sub) { func(py::cast(std::move(sub))); }, flags);
+            },
+            py::arg("sizes"), py::arg("func"), py::arg("flags") = 0,
+            "Slice this arena into len(sizes) sub-arenas, back-to-back, calling func(sub) once "
+            "per entry of sizes in order so it can store/move each one. Nothing is sliced and "
+            "func is never called unless every size (plus any flags.avoid_false_sharing padding) "
+            "fits; returns False in that case, True otherwise. The parent must outlive every sub-"
+            "arena handed to func.")
+        .def(
             "contains",
             [](const arena& a, py::buffer view) {
                 return a.contains(view.request().ptr);
             },
             py::arg("view"),
             "Check whether a buffer/memoryview (e.g. one returned by alloc/push_bytes/push_str/"
-            "partition.data) points into this arena's storage.")
+            "slice.data) points into this arena's storage.")
 
         // ---- prefetch / cache ---------------------------------------------
         .def(

@@ -1161,7 +1161,7 @@ bool arena::contains(const void* ptr) const noexcept
     return p >= m_impl->m_ptr && p < m_impl->m_ptr + m_impl->m_size;
 }
 
-arena arena::partition(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
+arena arena::slice(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
     auto& d = *m_impl;
 

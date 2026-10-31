@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include <CppUTest/CommandLineTestRunner.h>
 #include <CppUTest/TestHarness.h>
@@ -410,10 +411,10 @@ TEST(FreestandingContains, PushedObjectIsContained)
     CHECK_TRUE(a.contains(&value));
 }
 
-TEST(FreestandingContains, PartitionPointerIsContainedInBothArenas)
+TEST(FreestandingContains, SlicePointerIsContainedInBothArenas)
 {
     auto parent = make_pool_arena();
-    auto sub = parent.partition(1024, 512);
+    auto sub = parent.slice(1024, 512);
 
     CHECK_TRUE(parent.contains(sub.data().data()));
     CHECK_TRUE(sub.contains(sub.data().data()));
@@ -421,52 +422,52 @@ TEST(FreestandingContains, PartitionPointerIsContainedInBothArenas)
 }
 
 // ---------------------------------------------------------------------------
-// Partitions
+// Slices
 // ---------------------------------------------------------------------------
-TEST_GROUP(FreestandingPartition)
+TEST_GROUP(FreestandingSlice)
 {
     void setup() override { std::memset(g_pool, 0xEE, sizeof(g_pool)); }
 };
 
-TEST(FreestandingPartition, IsAnExternalViewOfTheParent)
+TEST(FreestandingSlice, IsAnExternalViewOfTheParent)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
 
-    auto sub = parent.partition(1024, 512);
+    auto sub = parent.slice(1024, 512);
 
     LONGS_EQUAL((long)memory_source::external, (long)sub.source());
     UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
     POINTERS_EQUAL(g_pool + 1024, sub.data().data());
 }
 
-TEST(FreestandingPartition, IsZeroedByDefault)
+TEST(FreestandingSlice, IsZeroedByDefault)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
 
-    auto sub = parent.partition(1024, 256);
+    auto sub = parent.slice(1024, 256);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
     CHECK_TRUE(all_equal(g_pool, 1024, 0xEE));
     CHECK_TRUE(all_equal(g_pool + 1280, 256, 0xEE));
 }
 
-TEST(FreestandingPartition, NoClearKeepsTheExistingBytes)
+TEST(FreestandingSlice, NoClearKeepsTheExistingBytes)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
 
-    auto sub = parent.partition(1024, 256, flags::no_clear);
+    auto sub = parent.slice(1024, 256, flags::no_clear);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0xEE));
 }
 
-TEST(FreestandingPartition, DoesNotDisturbTheParentOffset)
+TEST(FreestandingSlice, DoesNotDisturbTheParentOffset)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::commit);
     auto& anchor = parent.push<int>(1);
     (void)anchor;
     auto used = parent.used();
 
-    auto sub = parent.partition(2048, 512);
+    auto sub = parent.slice(2048, 512);
     auto span = sub.push_array<int>(16);
     (void)span;
 
@@ -474,12 +475,12 @@ TEST(FreestandingPartition, DoesNotDisturbTheParentOffset)
     UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int)), sub.used());
 }
 
-TEST(FreestandingPartition, SiblingsAreIndependent)
+TEST(FreestandingSlice, SiblingsAreIndependent)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::commit);
 
-    auto left = parent.partition(0, 1024);
-    auto right = parent.partition(2048, 1024);
+    auto left = parent.slice(0, 1024);
+    auto right = parent.slice(2048, 1024);
 
     auto ls = left.push_array<std::byte>(64);
     auto rs = right.push_array<std::byte>(128);
@@ -493,24 +494,93 @@ TEST(FreestandingPartition, SiblingsAreIndependent)
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
 }
 
-TEST(FreestandingPartition, AvoidFalseSharingKeepsTheRequestedCapacity)
+TEST(FreestandingSlice, AvoidFalseSharingKeepsTheRequestedCapacity)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
 
-    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+    auto sub = parent.slice(1024, 512, flags::avoid_false_sharing);
 
     UNSIGNED_LONGS_EQUAL(512u, sub.capacity());
     POINTERS_EQUAL(g_pool + 1024, sub.data().data());
 }
 
-TEST(FreestandingPartition, AvoidFalseSharingZeroesTheGuardBytesToo)
+TEST(FreestandingSlice, AvoidFalseSharingZeroesTheGuardBytesToo)
 {
     auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
 
-    auto sub = parent.partition(1024, 512, flags::avoid_false_sharing);
+    auto sub = parent.slice(1024, 512, flags::avoid_false_sharing);
 
     CHECK_TRUE(all_equal(sub.data().data(), sub.data().size(), 0x00));
     CHECK_TRUE(all_equal(g_pool + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0x00));
+}
+
+// ---------------------------------------------------------------------------
+// Partitioning (bulk slicing via callback)
+// ---------------------------------------------------------------------------
+TEST_GROUP(FreestandingPartition)
+{
+    void setup() override { std::memset(g_pool, 0xEE, sizeof(g_pool)); }
+};
+
+TEST(FreestandingPartition, CallsFuncOnceForEachSizeInOrder)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+    std::size_t sizes[] = { 256, 512, 128 };
+    std::vector<arena> subs;
+
+    auto ok = parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); });
+
+    CHECK_TRUE(ok);
+    UNSIGNED_LONGS_EQUAL(3u, subs.size());
+    UNSIGNED_LONGS_EQUAL(256u, subs[0].capacity());
+    UNSIGNED_LONGS_EQUAL(512u, subs[1].capacity());
+    UNSIGNED_LONGS_EQUAL(128u, subs[2].capacity());
+    POINTERS_EQUAL(g_pool, subs[0].data().data());
+    POINTERS_EQUAL(g_pool + 256, subs[1].data().data());
+    POINTERS_EQUAL(g_pool + 256 + 512, subs[2].data().data());
+}
+
+TEST(FreestandingPartition, AvoidFalseSharingSpacesSlicesApart)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+    std::size_t sizes[] = { 256, 512 };
+    std::vector<arena> subs;
+
+    auto ok = parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); },
+        flags::avoid_false_sharing);
+
+    CHECK_TRUE(ok);
+    POINTERS_EQUAL(g_pool + 256 + ENGRAM_FALSE_SHARING_PAD, subs[1].data().data());
+}
+
+TEST(FreestandingPartition, SiblingsAreIndependent)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+    std::size_t sizes[] = { 64, 128 };
+    std::vector<arena> subs;
+
+    parent.partition(sizes, [&](arena&& sub) { subs.push_back(std::move(sub)); });
+
+    auto ls = subs[0].push_array<std::byte>(64);
+    auto rs = subs[1].push_array<std::byte>(128);
+
+    std::memset(ls.data(), 0x11, ls.size());
+    std::memset(rs.data(), 0x22, rs.size());
+
+    CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
+    CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
+}
+
+TEST(FreestandingPartition, ReturnsFalseAndSkipsFuncWhenItDoesNotFit)
+{
+    auto parent = arena::adopt(g_pool, sizeof(g_pool), flags::none);
+    std::size_t sizes[] = { sizeof(g_pool), sizeof(g_pool) };
+    int calls = 0;
+
+    auto ok = parent.partition(sizes, [&](arena&&) { ++calls; });
+
+    CHECK_FALSE(ok);
+    LONGS_EQUAL(0, calls);
 }
 
 // ---------------------------------------------------------------------------

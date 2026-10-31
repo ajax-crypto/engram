@@ -226,7 +226,7 @@ engram::arena make_scratch()
 
 The same applies to passing it to a by-value parameter. Only an explicit
 `std::move(scratch)` still compiles — that is a deliberate act, and it dangles.
-Partitions of a stack arena are ordinary arenas and *are* movable, so they carry
+Slices of a stack arena are ordinary arenas and *are* movable, so they carry
 no such guard; do not let one outlive the frame either.
 
 ### Flags
@@ -245,7 +245,7 @@ Behavior is tuned with the `int32_t` constants in the `engram::flags` namespace
 | `flags::no_clear`        | Don't zero the memory when the arena is freed.      |
 | `flags::pin_to_physical` | Lock the pages into RAM (`mlock` / `VirtualLock`).  |
 | `flags::unified`         | Unified / shareable memory: `memfd` on the Linux heap; managed memory (`cudaMallocManaged` / `hipMallocManaged`) for CUDA / ROCm. |
-| `flags::avoid_false_sharing` | `arena::partition` only: additionally reserve `ENGRAM_FALSE_SHARING_PAD` bytes beyond `size`, unused, so adjacent partitions can't share a cache line — see [Partitioning](#partitioning-sub-arenas). |
+| `flags::avoid_false_sharing` | `arena::slice` / `arena::partition` only: additionally reserve `ENGRAM_FALSE_SHARING_PAD` bytes beyond each requested size, unused, so adjacent slices can't share a cache line — see [Slicing](#slicing-sub-arenas). |
 
 By default an arena scrubs (zeroes) its memory when it is destroyed; pass
 `flags::no_clear` to skip that.
@@ -413,7 +413,7 @@ Define `ENGRAM_DISABLE_TRACKING` to drop those counters (and the two `std::size_
 fields backing them) entirely; both accessors then always return `0`.
 
 `contains(ptr)` checks whether `ptr` lies within this arena's own storage —
-useful for routing a pointer back to the sub-arena (see [Partitioning](#partitioning-sub-arenas))
+useful for routing a pointer back to the sub-arena (see [Slicing](#slicing-sub-arenas))
 that owns it, or for asserting that a pointer a caller handed back actually came
 from this arena. It is bounds-only: it does not check alignment or that `ptr`
 lands on an allocation boundary. `nullptr` and an arena with no storage (`!is_valid()`)
@@ -426,7 +426,7 @@ so ownership of the underlying memory is never accidentally duplicated.
 
 `save()` records the current head; `restore()` rewinds to the most recent save
 point, zeroing everything pushed since and putting the allocation bookkeeping
-back where it was. It is the implicit counterpart to `partition` — a scratch
+back where it was. It is the implicit counterpart to `slice` — a scratch
 scope with no explicit region, no size to pick up front, and no second arena
 object:
 
@@ -484,9 +484,9 @@ once. See [Build profiles](#build-profiles) for the bundled `ENGRAM_MINIMAL` pre
 > (`memory_source::custom`) arenas are never host-cleared, since their storage
 > may not be addressable from the CPU.
 
-### Partitioning (sub-arenas)
+### Slicing (sub-arenas)
 
-`partition(start, size, flags)` carves a fixed region of an arena into an
+`slice(start, size, flags)` carves a fixed region of an arena into an
 independent **sub-arena** you can hand to a child function or worker thread. The
 sub-arena is a non-owning `memory_source::external` view of `[start, start +
 size)`; destroying it leaves the parent (and its memory) untouched, so no extra
@@ -501,7 +501,7 @@ guard against that — it additionally reserves `ENGRAM_FALSE_SHARING_PAD`
 (default 128) bytes right after `[start, start + size)` as unused padding, so
 the real region taken from the parent is `size + ENGRAM_FALSE_SHARING_PAD`
 bytes while the sub-arena's `capacity()` stays exactly `size`. Because the pad
-is extra, not carved out of `size`, the **stride** between partitions — not
+is extra, not carved out of `size`, the **stride** between slices — not
 just their requested size — has to grow by the pad to keep them apart:
 
 ```cpp
@@ -510,14 +510,14 @@ auto pool = arena::heap(4 << 20);              // 4 MiB backing block
 // Split the pool into per-worker slices and run them in parallel.
 constexpr std::size_t workers = 4;
 const std::size_t stride = pool.capacity() / workers;
-const std::size_t slice = stride - ENGRAM_FALSE_SHARING_PAD;   // + the pad == stride
+const std::size_t span = stride - ENGRAM_FALSE_SHARING_PAD;   // + the pad == stride
 
 std::vector<std::thread> threads;
 for (std::size_t i = 0; i < workers; ++i)
 {
-    // Each worker's real span is `slice + ENGRAM_FALSE_SHARING_PAD` == stride
+    // Each worker's real span is `span + ENGRAM_FALSE_SHARING_PAD` == stride
     // bytes, so consecutive workers never share a cache line.
-    engram::arena sub = pool.partition(i * stride, slice, engram::flags::avoid_false_sharing);
+    engram::arena sub = pool.slice(i * stride, span, engram::flags::avoid_false_sharing);
     threads.emplace_back([sub = std::move(sub)]() mutable {
         auto scratch = sub.push_array<float>(256);   // each thread bump-allocates
         // ... work only within this thread's slice ...
@@ -533,11 +533,44 @@ bytes and need no locking. The same pattern hands a scratch slice to a callee:
 void render(engram::arena scratch);            // takes its own sub-arena
 
 auto frame = arena::heap(1 << 20);
-render(frame.partition(0, 64 * 1024));         // give the callee a 64 KiB slice
+render(frame.slice(0, 64 * 1024));             // give the callee a 64 KiB slice
 ```
 
 > The parent arena must outlive every sub-arena carved from it, since the
 > sub-arena points into the parent's memory.
+
+#### Partitioning (bulk slicing via callback)
+
+`partition(sizes, func, flags)` cuts several sub-arenas out of an arena in one
+call — back-to-back, in the order given — instead of computing each offset by
+hand and calling `slice` yourself. `sizes` is the size in bytes of each
+requested sub-arena; `flags` applies to every one of them; `func` is called as
+`func(arena&&)` once per entry of `sizes`, in order, so it can move each
+sub-arena wherever it needs to go — into a container, a thread's capture list,
+anywhere. The call is **all-or-nothing**: if the sum of `sizes` (plus any
+`flags::avoid_false_sharing` padding) doesn't fit the parent's capacity,
+`partition` returns `false` without slicing anything or calling `func` at all;
+otherwise every slice is made, `func` runs once per entry, and it returns `true`.
+
+```cpp
+auto pool = arena::heap(4 << 20);                      // 4 MiB backing block
+
+constexpr std::size_t workers = 4;
+std::size_t sizes[workers] = { 1 << 20, 1 << 20, 1 << 20, 1 << 20 };
+
+std::vector<std::thread> threads;
+bool ok = pool.partition(sizes, [&](engram::arena&& sub) {
+    threads.emplace_back([sub = std::move(sub)]() mutable {
+        auto scratch = sub.push_array<float>(256);
+        // ... work only within this thread's slice ...
+    });
+}, engram::flags::avoid_false_sharing);
+
+assert(ok);                 // the four 1 MiB + pad slices fit in the 4 MiB pool
+for (auto& t : threads) t.join();
+```
+
+> As with `slice`, the parent arena must outlive every sub-arena `func` is handed.
 
 ### PMR Integration
 
@@ -704,7 +737,7 @@ std::printf("arena from %s:%u (%s)\n",
 
 Because the default argument is evaluated at the **call site**, the location is your
 code, not a line inside engram — including through `ENGRAM_STACK_ARENA`, which
-records the line the macro was written on. `partition` records its own call site
+records the line the macro was written on. `slice` records its own call site
 rather than the parent's, so a sub-arena points at the code that carved it out.
 
 It is enabled automatically in debug builds (`_DEBUG`); define
@@ -719,8 +752,8 @@ Where it earns its keep:
 - **Whose pointer is this?** A dangling pointer into a released arena is otherwise
   anonymous. Print the origin in your teardown or watchdog path to identify the
   arena the memory came from.
-- **Stale sub-arenas.** `partition` hands out views that must not outlive the parent;
-  a partition's origin points straight at the call that created the view.
+- **Stale sub-arenas.** `slice` hands out views that must not outlive the parent;
+  a slice's origin points straight at the call that created the view.
 - **Leaked scratch.** Pair `origin()` with `count()` when an arena is destroyed
   non-empty to find the scope that forgot to `pop` or `restore`.
 
@@ -958,7 +991,7 @@ Need heap arenas or a vendor/device backend? Use the
 
 **What you keep:** stack and adopted arenas, and every arena feature built on
 them — `push` / `push_array` / `push_string`, the matching `pop`s (including
-`ENGRAM_EASY_POP`), `save` / `restore`, `reset`, `partition`, `data`, and all the
+`ENGRAM_EASY_POP`), `save` / `restore`, `reset`, `slice`, `partition`, `data`, and all the
 introspection accessors. `ENGRAM_STACK_ARENA` works unchanged; the size check
 uses `ENGRAM_FREESTANDING_STACKSZ` instead of asking the OS.
 
@@ -1031,7 +1064,7 @@ cmake -S . -B build -DENGRAM_MINIMAL=ON
 
 | Kept                                    | Removed                                        |
 | --------------------------------------- | ---------------------------------------------- |
-| Heap, stack, adopted and partitioned arenas | `save` / `restore` / `save_depth`          |
+| Heap, stack, adopted and sliced arenas | `save` / `restore` / `save_depth`          |
 | `push` / `push_array` / `push_string` and every `pop` | Allocation tracking (`count`, `total` read 0) |
 | `reset`, `data`, and the error accessors | `get_pmr_resource` and `<memory_resource>`     |
 | One native GPU backend per platform      | Every other vendor backend                     |
@@ -1119,7 +1152,7 @@ can be set either way; the rest are compiler defines.
 | `ENGRAM_FREESTANDING_STACKSZ`| `65536`   | Stack budget `ENGRAM_STACK_ARENA` is checked against when there is no OS to ask. |
 | `ENGRAM_FALLBACK_PAGESZ`     | `4096`    | Page size assumed when the OS query fails.                   |
 | `ENGRAM_CACHELINE_SZ`        | `64`      | Bytes covered per prefetch instruction in `warm_cache`.      |
-| `ENGRAM_FALSE_SHARING_PAD`   | `128`     | Extra bytes `arena::partition` reserves beyond `size` under `flags::avoid_false_sharing`. |
+| `ENGRAM_FALSE_SHARING_PAD`   | `128`     | Extra bytes `arena::slice` / `arena::partition` reserve beyond each requested size under `flags::avoid_false_sharing`. |
 | `ENGRAM_ABORT()`             | `abort()` | Taken on unrecoverable misuse (an exhausted `push<T>`). Must not return. |
 
 **Backends** — `ENGRAM_ENABLE_VULKAN`, `_DX12`, `_CUDA`, `_ROCM`, `_XDNA`, `_OPENCL`,
@@ -1291,7 +1324,7 @@ Coverage spans the allocation flags, each `memory_source` (including real
 `ENGRAM_STACK_ARENA` storage, which the macro makes testable), `arena_error`
 reporting, element construction, push/pop and array/string round-trips (including
 destructor calls, alignment, allocation counting and exhaustion), the dispatching
-`pop(el)` overload, partitions,
+`pop(el)` overload, slices,
 save/restore, `push_md_array` shape/layout/initialization, creation-site capture,
 the untyped `pop()` under `ENGRAM_EASY_POP` (rewind, zeroing, record-stack bounds,
 and the interplay with typed pops, `reset` and `restore`), the advisory
@@ -1339,6 +1372,10 @@ a.restore()                                     # scratch is reclaimed and zeroe
 print(a.used, a.capacity, a.remaining, a.source)
 print(a.contains(mv))                           # True: mv points into a's storage
 
+subs = []
+ok = a.partition([1024, 2048], lambda sub: subs.append(sub))   # ok is False (and
+                                                                 # subs stays empty) if it doesn't fit
+
 # adopt a buffer you already own (the arena will not free it)
 buf = bytearray(4096)
 b = engram.Arena.adopt(buf, engram.Flag.COMMIT)
@@ -1350,7 +1387,7 @@ engram.prefetch(buf)
 
 What's exposed: the `Arena` factories (`create`, `heap`, `adopt`, plus `named_heap`
 and `heapfile` on Linux), byte allocation (`alloc`, `push_bytes`, `push_str`,
-`pop_bytes`, `pop_str`, `partition`), scoped rewind (`save`, `restore`,
+`pop_bytes`, `pop_str`, `slice`, `partition`), scoped rewind (`save`, `restore`,
 `save_depth`), introspection (`used`, `capacity`, `remaining`, `count`, `total`,
 `source`, `error`, `data`, `contains`, `is_valid`, `empty`), `prefetch` / `warm_cache` /
 `sync` / `reset` / `unpin`, the `MemorySource`, `CacheLocality`, and `ArenaError`

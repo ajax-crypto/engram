@@ -56,7 +56,7 @@
 #define ENGRAM_CACHELINE_SZ 64
 #endif
 
-/** @brief Bytes reserved as a trailing guard by `flags::avoid_false_sharing` in @ref engram::arena::partition. */
+/** @brief Bytes reserved as a trailing guard by `flags::avoid_false_sharing` in @ref engram::arena::slice. */
 #ifndef ENGRAM_FALSE_SHARING_PAD
 #define ENGRAM_FALSE_SHARING_PAD 128
 #endif
@@ -204,10 +204,10 @@ namespace flags
     /// `VirtualAlloc(MEM_RESERVE)`); the range is inaccessible until the caller commits a
     /// sub-range through platform-specific means.
     constexpr int32_t reserve_only = 256;
-    /// `arena::partition` only: additionally reserve a trailing `ENGRAM_FALSE_SHARING_PAD`-byte
+    /// `arena::slice` only: additionally reserve a trailing `ENGRAM_FALSE_SHARING_PAD`-byte
     /// buffer right after the requested region, so the real span taken from the parent is
     /// `size + ENGRAM_FALSE_SHARING_PAD` bytes while the sub-arena's capacity stays `size`;
-    /// adjacent partitions never share a cache line.
+    /// adjacent slices never share a cache line.
     constexpr int32_t avoid_false_sharing = 512;
 
     constexpr int32_t read = 1;              ///< Cache-warm read intent (@ref warm_cache ioflags).
@@ -1043,7 +1043,7 @@ public:
      *              a cache line with whatever follows it in the parent.
      * @return A sub-arena bound to `[start, start + size)`.
      */
-    [[nodiscard]] arena partition(std::size_t start, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
+    [[nodiscard]] arena slice(std::size_t start, std::size_t size, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
     {
         // avoid_false_sharing reserves ENGRAM_FALSE_SHARING_PAD extra bytes beyond
         // `size` in the parent as an unused guard; the sub-arena's capacity is
@@ -1059,6 +1059,41 @@ public:
             memset(m_ptr + start, 0, reserved);
 
         return adopt(m_ptr + start, size, engram::flags::no_clear ENGRAM_SOURCE_ARG);
+    }
+
+    /**
+     * @brief Slice this arena into several sub-arenas, back-to-back, in one call.
+     *
+     * @details Equivalent to calling @ref slice once per entry of @p sizes, with each
+     * region starting right after the previous one's reserved span (including any
+     * `avoid_false_sharing` padding — see @ref slice), and @p func called with each
+     * resulting sub-arena in order so it can move it wherever it needs to go (a
+     * container, a thread's capture list, …). Nothing is sliced and @p func is never
+     * called unless every requested size (plus any padding) fits: the whole call is
+     * all-or-nothing.
+     * @param sizes Size in bytes of each requested sub-arena, in order.
+     * @param func  Called as `func(arena&&)` once per entry of @p sizes, in order.
+     * @param flags @ref flags applied to every sub-arena (see the single-region @ref slice).
+     * @return `false` without calling @p func at all if the sum of @p sizes (plus any
+     *         `avoid_false_sharing` padding) exceeds this arena's capacity; `true` otherwise.
+     */
+    template <typename FuncT>
+    [[nodiscard]] bool partition(std::span<const std::size_t> sizes, FuncT&& func, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
+    {
+        auto pad = (flags & engram::flags::avoid_false_sharing) ? ENGRAM_FALSE_SHARING_PAD : 0;
+        std::size_t total = 0;
+        for (auto len : sizes)
+            total += len + pad;
+        if (total > m_size)
+            return false;
+
+        std::size_t offset = 0;
+        for (auto len : sizes)
+        {
+            func(slice(offset, len, flags ENGRAM_SOURCE_ARG));
+            offset += len + pad;
+        }
+        return true;
     }
 };
 
