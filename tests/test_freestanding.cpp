@@ -41,6 +41,15 @@ constexpr std::size_t aligned(std::size_t n)
     return (n + (kAlign - 1)) & ~(kAlign - 1);
 }
 
+// push_array/push_string reserve this many extra bytes for an overwrite-detection
+// canary when ENGRAM_ENABLE_DIAGNOSTICS is active, so byte-exact expectations below
+// have to account for it to stay correct in both configurations.
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+constexpr std::size_t kGuardSz = 4;
+#else
+constexpr std::size_t kGuardSz = 0;
+#endif
+
 // The hosted-only surface must not be reachable at all.
 template <typename T, typename = void>
 struct has_heap_factory : std::false_type {};
@@ -100,6 +109,33 @@ bool all_equal(const std::byte* start, std::size_t size, unsigned char value)
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Byte-count literals
+// ---------------------------------------------------------------------------
+TEST_GROUP(FreestandingLiterals)
+{
+};
+
+TEST(FreestandingLiterals, MatchTheBinaryUnits)
+{
+    using namespace engram;
+
+    UNSIGNED_LONGS_EQUAL(1024u, (std::size_t)1_KB);
+    UNSIGNED_LONGS_EQUAL(1024u * 1024u, (std::size_t)1_MB);
+    UNSIGNED_LONGS_EQUAL(1024u * 1024u * 1024u, (std::size_t)1_GB);
+    UNSIGNED_LONGS_EQUAL(1024ull * 1024ull * 1024ull * 1024ull, (unsigned long long)1_TB);
+}
+
+TEST(FreestandingLiterals, WorkDirectlyAsAnArenaSize)
+{
+    using namespace engram;
+
+    auto a = arena::adopt(g_pool, 4_KB);
+
+    CHECK_TRUE(a.is_valid());
+    UNSIGNED_LONGS_EQUAL(4u * 1024u, a.capacity());
+}
 
 // ---------------------------------------------------------------------------
 // Memory sources available without an OS
@@ -293,7 +329,7 @@ TEST(FreestandingAllocation, PushStringCopiesAndNulTerminates)
 
     UNSIGNED_LONGS_EQUAL(6u, view.size());
     STRCMP_EQUAL("engram", view.data());
-    UNSIGNED_LONGS_EQUAL(aligned(7), a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(7 + kGuardSz), a.used());
 
     a.pop_string(view);
 
@@ -302,7 +338,7 @@ TEST(FreestandingAllocation, PushStringCopiesAndNulTerminates)
 
 TEST(FreestandingAllocation, ExhaustedArenaReturnsAnEmptySpan)
 {
-    alignas(std::max_align_t) static std::byte small[128];
+    alignas(std::max_align_t) static std::byte small[aligned(128 + kGuardSz)];
     auto a = arena::adopt(small, sizeof(small), flags::commit);
 
     auto ok = a.push_array<std::byte>(128);
@@ -312,7 +348,7 @@ TEST(FreestandingAllocation, ExhaustedArenaReturnsAnEmptySpan)
     auto overflow = a.push_array<std::byte>(1);
     CHECK_TRUE(overflow.empty());
     LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
-    UNSIGNED_LONGS_EQUAL(128u, a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(128 + kGuardSz), a.used());
 }
 
 TEST(FreestandingAllocation, LifoOrderRestoresTheOffsetStepByStep)
@@ -472,7 +508,7 @@ TEST(FreestandingSlice, DoesNotDisturbTheParentOffset)
     (void)span;
 
     UNSIGNED_LONGS_EQUAL(used, parent.used());
-    UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int)), sub.used());
+    UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int) + kGuardSz), sub.used());
 }
 
 TEST(FreestandingSlice, SiblingsAreIndependent)
@@ -488,8 +524,8 @@ TEST(FreestandingSlice, SiblingsAreIndependent)
     std::memset(ls.data(), 0x11, ls.size());
     std::memset(rs.data(), 0x22, rs.size());
 
-    UNSIGNED_LONGS_EQUAL(64u, left.used());
-    UNSIGNED_LONGS_EQUAL(128u, right.used());
+    UNSIGNED_LONGS_EQUAL(aligned(64 + kGuardSz), left.used());
+    UNSIGNED_LONGS_EQUAL(aligned(128 + kGuardSz), right.used());
     CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
 }
@@ -728,6 +764,55 @@ TEST(FreestandingExtra, WarmCacheToleratesEdgeRanges)
     CHECK_TRUE(a.is_valid());
 }
 
+#endif
+
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+// ---------------------------------------------------------------------------
+// Overwrite detection (ENGRAM_ENABLE_DIAGNOSTICS, debug builds only)
+// ---------------------------------------------------------------------------
+TEST_GROUP(FreestandingOverwriteDetection)
+{
+};
+
+TEST(FreestandingOverwriteDetection, GuardBytesFollowAPushedArray)
+{
+    auto a = make_pool_arena();
+    auto span = a.push_array<int>(4);
+
+    auto guard = reinterpret_cast<const unsigned char*>(span.data() + span.size());
+    for (int i = 0; i < 4; ++i)
+        LONGS_EQUAL(0xCD, guard[i]);
+
+    a.pop_array(span);   // untouched guard pops cleanly
+}
+
+TEST(FreestandingOverwriteDetection, GuardBytesFollowAPushedString)
+{
+    auto a = make_pool_arena();
+    // std::string_view{...}, not a raw literal: a bare literal picks the
+    // compile-time push_string(CharT(&)[size]) overload with CharT deduced as
+    // `const char`, which is a pre-existing bug unrelated to this feature.
+    auto str = a.push_string(std::string_view{ "hi" });
+
+    // The NUL terminator sits at str.data() + str.size(); the guard follows that.
+    auto guard = reinterpret_cast<const unsigned char*>(str.data() + str.size() + 1);
+    for (int i = 0; i < 4; ++i)
+        LONGS_EQUAL(0xCD, guard[i]);
+
+    a.pop_string(str);
+}
+
+TEST(FreestandingOverwriteDetection, ReservationGrowsByTheGuardSize)
+{
+    auto a = make_pool_arena();
+    auto before = a.remaining();
+
+    auto span = a.push_array<std::byte>(16);
+
+    // 16 data bytes + 4 guard bytes, rounded up to the max-align quantum.
+    UNSIGNED_LONGS_EQUAL(aligned(16 + 4), before - a.remaining());
+    a.pop_array(span);
+}
 #endif
 
 int main(int argc, char** argv)

@@ -76,10 +76,36 @@ engram_add_test(engram_test_hcpp_srcinfo
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
 # And again with the untyped pop() enabled.
-engram_add_test(engram_test_hcpp_easypop
+engram_add_test(engram_test_hcpp_track_type_size
     SOURCES  test_hcpp.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
-    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_EASY_POP
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_TRACK_TYPE_SIZE
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+# And again with push_array/push_string overwrite detection, push-depth balance
+# asserts and RTTI type checks (debug builds only; see ENGRAM_ENABLE_DIAGNOSTICS
+# in engram.h). Its own dedicated suite: unlike test_hcpp.cpp, every test here
+# keeps push/pop balanced since the arena's destructor now asserts on imbalance.
+engram_add_test(engram_test_hcpp_diagnostics
+    SOURCES  test_diagnostics.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_DIAGNOSTICS
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+# ...and once more with ENGRAM_MASK_EXCEPTIONS too, so the truncate_array path
+# (a throwing constructor mid-push_array) also gets a guard.
+engram_add_test(engram_test_hcpp_diagnostics_masked
+    SOURCES  test_diagnostics.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_DIAGNOSTICS ENGRAM_MASK_EXCEPTIONS
+    LIBS     ${ENGRAM_HOSTED_LIBS})
+
+# ...and once more with ENGRAM_TRACK_TYPE_SIZE too, so the untyped pop()'s
+# interaction with the diagnostics depth counter gets covered as well.
+engram_add_test(engram_test_hcpp_diagnostics_track_type_size
+    SOURCES  test_diagnostics.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/engram.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../src
+    DEFINES  ${ENGRAM_DEFINITIONS} ENGRAM_ENABLE_DIAGNOSTICS ENGRAM_TRACK_TYPE_SIZE
     LIBS     ${ENGRAM_HOSTED_LIBS})
 
 # Trimmed profiles: what is left once save/restore, and then everything optional,
@@ -98,13 +124,18 @@ engram_add_test(engram_test_hcpp_minimal
 
 engram_add_test(engram_test_freestanding
     SOURCES  test_freestanding.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../freestanding
     DEFINES  ENGRAM_ENABLE_FREESTANDING)
 
 engram_add_test(engram_test_freestanding_fsextra
     SOURCES  test_freestanding.cpp
-    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../single_header
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../freestanding
     DEFINES  ENGRAM_ENABLE_FREESTANDING ENGRAM_ENABLE_FSEXTRA)
+
+engram_add_test(engram_test_freestanding_diagnostics
+    SOURCES  test_freestanding.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../freestanding
+    DEFINES  ENGRAM_ENABLE_FREESTANDING ENGRAM_ENABLE_DIAGNOSTICS)
 
 # push_md_array switches itself on when the standard library has <mdspan>, so the
 # only thing needed to cover it is a C++23 build of the same suite.
@@ -232,7 +263,7 @@ if(UNIX AND NOT APPLE)
 
     # Compiled, never linked: the driver symbols stay deliberately unresolved.
     # Vendor backends only exist in the header + source build now that
-    # single_header/engram.h is freestanding-only.
+    # freestanding/engram.h is freestanding-only.
     function(engram_add_vendor_conformance name)
         cmake_parse_arguments(ARG "" "" "SOURCES;INCLUDES;DEFINES" ${ARGN})
 

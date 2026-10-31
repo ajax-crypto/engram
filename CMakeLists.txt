@@ -8,7 +8,7 @@ project(engram
 # ---------------------------------------------------------------------------
 # Build-shape options
 # ---------------------------------------------------------------------------
-# ON  -> header-only build using single_header/engram.h (INTERFACE library,
+# ON  -> header-only build using freestanding/engram.h (INTERFACE library,
 #        freestanding-only: stack and adopted-external arenas, no heap, no
 #        vendor backends).
 # OFF -> split build using src/engram.h + src/engram.cpp (compiled library,
@@ -23,8 +23,9 @@ option(ENGRAM_ALL           "Enable every backend supported on the current platf
 option(ENGRAM_MINIMAL       "Trim to heap + the platform's native GPU backend only."  OFF)
 option(ENGRAM_DISABLE_PMR   "Disable std::pmr integration."                           OFF)
 option(ENGRAM_DISABLE_SAVE_RESTORE "Drop save/restore and the save-point stack."      OFF)
-option(ENGRAM_EASY_POP      "Enable the fixed-size array pop helpers."                 OFF)
+option(ENGRAM_TRACK_TYPE_SIZE      "Enable the fixed-size array pop helpers."                 OFF)
 option(ENGRAM_ENABLE_SOURCE_INFO "Record the creation site of every arena."           OFF)
+option(ENGRAM_ENABLE_DIAGNOSTICS "Canary-guard, push-depth and RTTI checks (also needs _DEBUG)." OFF)
 option(ENGRAM_BUILD_TESTS   "Build the CppUTest-based test suite."                    OFF)
 
 # ---------------------------------------------------------------------------
@@ -62,11 +63,14 @@ endif()
 if(ENGRAM_DISABLE_SAVE_RESTORE)
     list(APPEND ENGRAM_DEFINITIONS ENGRAM_DISABLE_SAVE_RESTORE)
 endif()
-if(ENGRAM_EASY_POP)
-    list(APPEND ENGRAM_DEFINITIONS ENGRAM_EASY_POP)
+if(ENGRAM_TRACK_TYPE_SIZE)
+    list(APPEND ENGRAM_DEFINITIONS ENGRAM_TRACK_TYPE_SIZE)
 endif()
 if(ENGRAM_ENABLE_SOURCE_INFO)
     list(APPEND ENGRAM_DEFINITIONS ENGRAM_ENABLE_SOURCE_INFO)
+endif()
+if(ENGRAM_ENABLE_DIAGNOSTICS)
+    list(APPEND ENGRAM_DEFINITIONS ENGRAM_ENABLE_DIAGNOSTICS)
 endif()
 
 foreach(backend
@@ -84,7 +88,7 @@ if(ENGRAM_SINGLE_HEADER)
     add_library(engram INTERFACE)
     set(ENGRAM_SCOPE INTERFACE)
     target_include_directories(engram INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/single_header>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/freestanding>
         $<INSTALL_INTERFACE:include>)
 else()
     add_library(engram STATIC src/engram.cpp)

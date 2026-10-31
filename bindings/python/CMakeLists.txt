@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(pybind11 CONFIG REQUIRED)
 
-# Bind against the header + source build: single_header/engram.h is
+# Bind against the header + source build: freestanding/engram.h is
 # freestanding-only (stack/external arenas, no heap, no vendor backends), so the
 # bindings need the full-featured split build instead.
 pybind11_add_module(_engram engram_ext.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../../src/engram.cpp)
@@ -28,9 +28,9 @@ if(ENGRAM_DISABLE_SAVE_RESTORE)
 endif()
 
 # Optional: add the untyped Arena.pop() and Arena.push_depth.
-option(ENGRAM_EASY_POP "Record every push so an untyped pop() can rewind it." OFF)
-if(ENGRAM_EASY_POP)
-    target_compile_definitions(_engram PRIVATE ENGRAM_EASY_POP)
+option(ENGRAM_TRACK_TYPE_SIZE "Record every push so an untyped pop() can rewind it." OFF)
+if(ENGRAM_TRACK_TYPE_SIZE)
+    target_compile_definitions(_engram PRIVATE ENGRAM_TRACK_TYPE_SIZE)
 endif()
 
 # Optional: record where each arena was created, exposed as Arena.origin. The site

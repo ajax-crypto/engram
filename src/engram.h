@@ -7,9 +7,9 @@
  */
 
 // This build keeps arena state in a heap-allocated impl_data, so it cannot run
-// without a heap. Freestanding targets need single_header/engram.h instead.
+// without a heap. Freestanding targets need freestanding/engram.h instead.
 #if defined(ENGRAM_ENABLE_FREESTANDING) || (defined(__STDC_HOSTED__) && (__STDC_HOSTED__ == 0))
-#error "engram: the header + source build requires a hosted implementation - arena state is heap-allocated through the PIMPL pointer. Use single_header/engram.h, which supports ENGRAM_ENABLE_FREESTANDING."
+#error "engram: the header + source build requires a hosted implementation - arena state is heap-allocated through the PIMPL pointer. Use freestanding/engram.h, which supports ENGRAM_ENABLE_FREESTANDING."
 #endif
 
 #ifdef ENGRAM_MINIMAL
@@ -29,7 +29,7 @@
 #undef ENGRAM_ENABLE_RDMA
 #undef ENGRAM_ENABLE_GPUDIRECT
 #undef ENGRAM_ENABLE_DMABUF
-#undef ENGRAM_EASY_POP
+#undef ENGRAM_TRACK_TYPE_SIZE
 
 // DX12 (Windows) and Metal (Apple) are switched on by the platform block below;
 // Vulkan is the Linux equivalent and has to be asked for.
@@ -53,6 +53,7 @@
 #ifndef ENGRAM_MASK_EXCEPTIONS
 #define ENGRAM_MASK_EXCEPTIONS
 #endif
+#undef ENGRAM_ENABLE_DIAGNOSTICS
 #endif
 
 #include <cstddef>
@@ -84,6 +85,21 @@
 #define ENGRAM_ENABLE_SOURCE_INFO
 #endif
 
+// Canary-guards push_array/push_string, tracks push/pop balance, and (RTTI)
+// validates the type given to pop against what was pushed. Opt-in: requires
+// both a debug build and this macro, so plain debug builds are unaffected.
+#if defined(ENGRAM_ENABLE_DIAGNOSTICS) && !defined(_DEBUG)
+#undef ENGRAM_ENABLE_DIAGNOSTICS
+#endif
+
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+#include <typeinfo>
+/** @brief Push records held per arena under `ENGRAM_ENABLE_DIAGNOSTICS`. */
+#ifndef ENGRAM_MAX_DIAG_DEPTH
+#define ENGRAM_MAX_DIAG_DEPTH 64
+#endif
+#endif
+
 #ifdef ENGRAM_ENABLE_SOURCE_INFO
 #include <source_location>
 // Appended to every factory so the default argument is evaluated at the call site.
@@ -96,6 +112,20 @@
 #define ENGRAM_SOURCE_ARG
 #endif
 
+// push<T>/push_array<T>/push_string record the type they stash; pop<T>/pop_array<T>/
+// pop_string check it back via RTTI, and the same records give push/pop their
+// balance-assert depth counter. `type_name == nullptr` skips the RTTI comparison
+// (used by the untyped ENGRAM_TRACK_TYPE_SIZE pop(), which has no type to compare).
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+#define ENGRAM_DIAG_PUSH(T)       diag_push_record(typeid(T).name(), sizeof(T))
+#define ENGRAM_DIAG_POP(T)        diag_pop_record(typeid(T).name(), sizeof(T))
+#define ENGRAM_DIAG_POP_UNTYPED() diag_pop_record(nullptr, 0)
+#else
+#define ENGRAM_DIAG_PUSH(T)       ((void)0)
+#define ENGRAM_DIAG_POP(T)        ((void)0)
+#define ENGRAM_DIAG_POP_UNTYPED() ((void)0)
+#endif
+
 #ifdef _MSC_VER
 #include <malloc.h>
 #define ENGRAM_STACK_ALLOC(sz) _alloca(sz)
@@ -106,7 +136,7 @@
 #define ENGRAM_STACK_ALLOC(sz) nullptr
 #endif
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
 /** @brief Number of pushes @ref engram::arena::pop can rewind through. */
 #ifndef ENGRAM_MAX_PUSH_DEPTH
 #define ENGRAM_MAX_PUSH_DEPTH 32
@@ -218,6 +248,15 @@ namespace flags
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).
 }
 
+/** @brief Binary (1024-based) byte-count literals for arena sizes, e.g. `arena::heap(4_MB)`. */
+constexpr std::size_t operator""_KB(unsigned long long n) { return static_cast<std::size_t>(n * 1024ull); }
+/** @copydoc operator""_KB */
+constexpr std::size_t operator""_MB(unsigned long long n) { return static_cast<std::size_t>(n * 1024ull * 1024ull); }
+/** @copydoc operator""_KB */
+constexpr std::size_t operator""_GB(unsigned long long n) { return static_cast<std::size_t>(n * 1024ull * 1024ull * 1024ull); }
+/** @copydoc operator""_KB */
+constexpr std::size_t operator""_TB(unsigned long long n) { return static_cast<std::size_t>(n * 1024ull * 1024ull * 1024ull * 1024ull); }
+
 /**
  * @brief Emit CPU prefetch hints for a host memory range.
  * @param ptr      Start of the range (any host pointer).
@@ -279,6 +318,31 @@ constexpr int32_t combine_flags(FlagsT... values)
 {
     return (int32_t{ engram::flags::none } | ... | static_cast<int32_t>(values));
 }
+
+// A fixed "CDCDCDCD" canary written right after every push_array/push_string
+// region under ENGRAM_ENABLE_DIAGNOSTICS; pop_array/pop_string check it still
+// reads back untouched before reclaiming the reservation. Folds away to a
+// no-op (size 0) everywhere else, so the arithmetic using it stays unchanged.
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+inline constexpr std::size_t overwrite_guard_sz = 4;
+inline constexpr unsigned char overwrite_guard_byte = 0xCD;
+
+inline void write_overwrite_guard(std::byte* ptr)
+{
+    memset(ptr, overwrite_guard_byte, overwrite_guard_sz);
+}
+
+inline void check_overwrite_guard(const std::byte* ptr)
+{
+    for (std::size_t i = 0; i < overwrite_guard_sz; ++i)
+        assert(std::to_integer<unsigned char>(ptr[i]) == overwrite_guard_byte &&
+            "engram: overwrite detected past the end of a push_array/push_string region");
+}
+#else
+inline constexpr std::size_t overwrite_guard_sz = 0;
+inline void write_overwrite_guard(std::byte*) {}
+inline void check_overwrite_guard(const std::byte*) {}
+#endif
 
 } // namespace detail
 
@@ -354,11 +418,14 @@ private:
     {
         if (built == 0)
         {
-            unreserve(align_up_max(sizeof(T) * size), true);
+            ENGRAM_DIAG_POP(T);
+            unreserve(align_up_max(sizeof(T) * size + detail::overwrite_guard_sz), true);
             return {};
         }
 
-        unreserve(align_up_max(sizeof(T) * size) - align_up_max(sizeof(T) * built), false);
+        detail::write_overwrite_guard((std::byte*)(base + built));
+        unreserve(align_up_max(sizeof(T) * size + detail::overwrite_guard_sz) -
+            align_up_max(sizeof(T) * built + detail::overwrite_guard_sz), false);
         return { base, built };
     }
 
@@ -370,13 +437,20 @@ private:
     std::byte* base_ptr() const;
 
     // Reserve `bytes` at the current head and return its address. Advances the
-    // offset; optionally bumps the allocation counters and (for ENGRAM_EASY_POP)
+    // offset; optionally bumps the allocation counters and (for ENGRAM_TRACK_TYPE_SIZE)
     // records the offset so the block can be popped without re-specifying it.
     std::byte* reserve(std::size_t bytes, bool countable);
 
     // Release `bytes` from the head and return the address of the freed block
     // (post-retreat head) so the caller can run destructors.
     std::byte* unreserve(std::size_t bytes, bool countable);
+
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    // Diagnostics-only bookkeeping (defined in engram.cpp): records/validates the
+    // pushed type via RTTI and tracks push/pop balance. See ENGRAM_DIAG_PUSH/POP.
+    void diag_push_record(const char* type_name, std::size_t type_size);
+    void diag_pop_record(const char* type_name, std::size_t type_size);
+#endif
 
     // Build an arena that adopts external storage (defined in engram.cpp).
     static arena make_external(std::byte* storage, std::size_t size, int32_t flags ENGRAM_SOURCE_PARAM);
@@ -551,6 +625,7 @@ public:
             assert(false && "engram: push() on an exhausted arena");
             ENGRAM_ABORT();
         }
+        ENGRAM_DIAG_PUSH(T);
 
         if constexpr (!std::is_same_v<T, arena>)
         {
@@ -561,6 +636,7 @@ public:
                 return *reinterpret_cast<T*>(slot);
 #if !defined(ENGRAM_MASK_EXCEPTIONS) && (defined(__cpp_exceptions) || defined(_CPPUNWIND))
             } catch (...) {
+                ENGRAM_DIAG_POP(T);
                 unreserve(sizeof(T), true);
                 throw;
             }
@@ -586,11 +662,13 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT (&str)[size])
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT) + detail::overwrite_guard_sz, true));
         if (!valptr)
             return {};
+        ENGRAM_DIAG_PUSH(CharT);
         Traits::copy(valptr, str, size);
         Traits::assign(valptr[size], CharT{});
+        detail::write_overwrite_guard((std::byte*)(valptr + size + 1));
         return { valptr, size };
     }
 
@@ -598,11 +676,13 @@ public:
     template <std::size_t size, typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT) + detail::overwrite_guard_sz, true));
         if (!valptr)
             return {};
+        ENGRAM_DIAG_PUSH(CharT);
         Traits::assign(valptr, size, fillchar);
         Traits::assign(valptr[size], CharT{});
+        detail::write_overwrite_guard((std::byte*)(valptr + size + 1));
         return { valptr, size };
     }
 
@@ -617,9 +697,10 @@ public:
 	{
 		assert(size > 0);
 
-		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size, true));
+		auto valptr = reinterpret_cast<T*>(reserve(sizeof(T) * size + detail::overwrite_guard_sz, true));
 		if (!valptr)
 			return {};
+		ENGRAM_DIAG_PUSH(T);
 
 		if constexpr (sizeof...(args) > 0 || !std::is_trivially_default_constructible_v<T>)
 		{
@@ -636,7 +717,8 @@ public:
 				} catch (...) {
 					while (idx-- > 0)
 						release<T>((std::byte*)(valptr + idx));
-					unreserve(align_up_max(sizeof(T) * size), true);
+					ENGRAM_DIAG_POP(T);
+					unreserve(align_up_max(sizeof(T) * size + detail::overwrite_guard_sz), true);
 					throw;
 				}
 #endif
@@ -645,6 +727,7 @@ public:
 #endif
 			}
 		}
+		detail::write_overwrite_guard((std::byte*)(valptr + size));
 		return { valptr, size };
 	}
 
@@ -695,11 +778,13 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::basic_string_view<CharT, Traits> str)
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT), true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((str.size() + 1) * sizeof(CharT) + detail::overwrite_guard_sz, true));
         if (!valptr)
             return {};
+        ENGRAM_DIAG_PUSH(CharT);
         Traits::copy(valptr, str.data(), str.size());
         Traits::assign(valptr[str.size()], CharT{});
+        detail::write_overwrite_guard((std::byte*)(valptr + str.size() + 1));
         return { valptr, str.size() };
     }
 
@@ -707,11 +792,13 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     [[nodiscard]] std::basic_string_view<CharT, Traits> push_string(std::size_t size, CharT fillchar = CharT{})
     {
-        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT), true));
+        auto valptr = reinterpret_cast<CharT*>(reserve((size + 1) * sizeof(CharT) + detail::overwrite_guard_sz, true));
         if (!valptr)
             return {};
+        ENGRAM_DIAG_PUSH(CharT);
         Traits::assign(valptr, size, fillchar);
         Traits::assign(valptr[size], CharT{});
+        detail::write_overwrite_guard((std::byte*)(valptr + size + 1));
         return { valptr, size };
     }
 	
@@ -719,6 +806,7 @@ public:
 	template <typename T>
 	void pop() 
 	{ 
+		ENGRAM_DIAG_POP(T);
 		release<T>(unreserve(sizeof(T), true));
 	}
 
@@ -726,7 +814,9 @@ public:
     template <typename T>
 	void pop_array(std::size_t size) 
     {
-		auto valptr = unreserve(sizeof(T) * size, true);
+		ENGRAM_DIAG_POP(T);
+		auto valptr = unreserve(sizeof(T) * size + detail::overwrite_guard_sz, true);
+		detail::check_overwrite_guard(valptr + sizeof(T) * size);
 		if constexpr (!std::is_scalar_v<T> && std::is_destructible_v<T>)
 			for (std::size_t idx = 0; idx < size; ++idx)
 				release<T>(valptr + (idx * sizeof(T)));
@@ -750,7 +840,9 @@ public:
     template <typename CharT = char, typename Traits = std::char_traits<CharT>>
     void pop_string(std::basic_string_view<CharT, Traits> str)
     {
-        unreserve((str.size() + 1) * sizeof(CharT), true);
+        ENGRAM_DIAG_POP(CharT);
+        auto valptr = unreserve((str.size() + 1) * sizeof(CharT) + detail::overwrite_guard_sz, true);
+        detail::check_overwrite_guard(valptr + (str.size() + 1) * sizeof(CharT));
     }
 
     /**
@@ -778,10 +870,10 @@ public:
             pop<bare>();
     }
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
 
     /**
-     * @brief Pop the most recent push, whatever it was (requires `ENGRAM_EASY_POP`).
+     * @brief Pop the most recent push, whatever it was (requires `ENGRAM_TRACK_TYPE_SIZE`).
      *
      * @details Every `push*` records the offset it started at, so this rewinds to it
      * without being told the type or the element count. It runs **no destructors** — use

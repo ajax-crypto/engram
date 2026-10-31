@@ -31,6 +31,15 @@ constexpr std::size_t aligned(std::size_t n)
     return (n + (kAlign - 1)) & ~(kAlign - 1);
 }
 
+// push_array/push_string reserve this many extra bytes for an overwrite-detection
+// canary when ENGRAM_ENABLE_DIAGNOSTICS is active, so byte-exact expectations below
+// have to account for it to stay correct in both configurations.
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+constexpr std::size_t kGuardSz = 4;
+#else
+constexpr std::size_t kGuardSz = 0;
+#endif
+
 struct Tracked
 {
     static int constructed;
@@ -112,6 +121,35 @@ bool all_equal(const std::byte* start, std::size_t size, unsigned char value)
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Byte-count literals
+// ---------------------------------------------------------------------------
+TEST_GROUP(Literals)
+{
+};
+
+TEST(Literals, MatchTheBinaryUnits)
+{
+    using namespace engram;
+
+    UNSIGNED_LONGS_EQUAL(1024u, (std::size_t)1_KB);
+    UNSIGNED_LONGS_EQUAL(1024u * 1024u, (std::size_t)1_MB);
+    UNSIGNED_LONGS_EQUAL(1024u * 1024u * 1024u, (std::size_t)1_GB);
+    UNSIGNED_LONGS_EQUAL(1024ull * 1024ull * 1024ull * 1024ull, (unsigned long long)1_TB);
+
+    UNSIGNED_LONGS_EQUAL(4u * 1024u * 1024u, (std::size_t)4_MB);
+}
+
+TEST(Literals, WorkDirectlyAsAnArenaSize)
+{
+    using namespace engram;
+
+    auto a = arena::heap(4_MB);
+
+    CHECK_TRUE(a.is_valid());
+    UNSIGNED_LONGS_EQUAL(4u * 1024u * 1024u, a.capacity());
+}
 
 // ---------------------------------------------------------------------------
 // Creation, memory sources and error reporting
@@ -414,7 +452,7 @@ TEST(Allocation, PushArrayIsContiguousAndRewindsExactly)
     auto span = a.push_array<int>(64);
 
     UNSIGNED_LONGS_EQUAL(64u, span.size());
-    UNSIGNED_LONGS_EQUAL(aligned(64 * sizeof(int)), a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(64 * sizeof(int) + kGuardSz), a.used());
     POINTERS_EQUAL(a.data().data(), reinterpret_cast<std::byte*>(span.data()));
 
     a.pop_array<int>(64);
@@ -430,7 +468,7 @@ TEST(Allocation, PushStringCopiesAndNulTerminates)
 
     UNSIGNED_LONGS_EQUAL(6u, view.size());
     STRCMP_EQUAL("engram", view.data());
-    UNSIGNED_LONGS_EQUAL(aligned(7), a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(7 + kGuardSz), a.used());
 
     a.pop_string(view);
 
@@ -469,7 +507,7 @@ TEST(Allocation, LifoOrderRestoresTheOffsetStepByStep)
 
 TEST(Allocation, ExhaustedArenaReturnsAnEmptySpan)
 {
-    alignas(std::max_align_t) unsigned char storage[128];
+    alignas(std::max_align_t) unsigned char storage[aligned(128 + kGuardSz)];
     auto a = arena::adopt(storage, sizeof(storage));
 
     auto ok = a.push_array<std::byte>(128);
@@ -479,7 +517,7 @@ TEST(Allocation, ExhaustedArenaReturnsAnEmptySpan)
     auto overflow = a.push_array<std::byte>(1);
     CHECK_TRUE(overflow.empty());
     LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
-    UNSIGNED_LONGS_EQUAL(128u, a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(128 + kGuardSz), a.used());
 }
 
 TEST(Allocation, EveryPushIsCountedAndEveryPopUncountsIt)
@@ -648,7 +686,7 @@ TEST(Slice, DoesNotDisturbTheParentOffset)
     (void)span;
 
     UNSIGNED_LONGS_EQUAL(used, parent.used());
-    UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int)), sub.used());
+    UNSIGNED_LONGS_EQUAL(aligned(16 * sizeof(int) + kGuardSz), sub.used());
 }
 
 TEST(Slice, IsZeroedByDefault)
@@ -703,8 +741,8 @@ TEST(Slice, SiblingsAreIndependent)
     std::memset(ls.data(), 0x11, ls.size());
     std::memset(rs.data(), 0x22, rs.size());
 
-    UNSIGNED_LONGS_EQUAL(64u, left.used());
-    UNSIGNED_LONGS_EQUAL(128u, right.used());
+    UNSIGNED_LONGS_EQUAL(aligned(64 + kGuardSz), left.used());
+    UNSIGNED_LONGS_EQUAL(aligned(128 + kGuardSz), right.used());
     CHECK_TRUE(all_equal(ls.data(), ls.size(), 0x11));
     CHECK_TRUE(all_equal(rs.data(), rs.size(), 0x22));
 }
@@ -726,8 +764,8 @@ TEST(Slice, AvoidFalseSharingReservesSizePlusPadInTheParent)
     auto guarded = parent.slice(0, 512, flags::avoid_false_sharing);
     auto next = parent.slice(512 + ENGRAM_FALSE_SHARING_PAD, 64);
 
-    auto gs = guarded.push_array<std::byte>(guarded.capacity());
-    auto ns = next.push_array<std::byte>(64);
+    auto gs = guarded.push_array<std::byte>(guarded.capacity() - kGuardSz);
+    auto ns = next.push_array<std::byte>(64 - kGuardSz);
 
     // The pad keeps `next`'s storage ENGRAM_FALSE_SHARING_PAD bytes away from
     // whatever `guarded` actually uses.
@@ -1070,7 +1108,7 @@ TEST(Construction, CompileTimeAndRuntimeArraysBehaveIdentically)
 
     UNSIGNED_LONGS_EQUAL(fixed.size(), runtime.size());
     LONGS_EQUAL(8, Tracked::constructed);
-    UNSIGNED_LONGS_EQUAL(2u * aligned(4 * sizeof(Tracked)), a.used());
+    UNSIGNED_LONGS_EQUAL(2u * aligned(4 * sizeof(Tracked) + kGuardSz), a.used());
 
     a.pop_array(runtime);
     a.pop_array(fixed);
@@ -1442,10 +1480,10 @@ TEST(SourceInfo, OriginSurvivesAMove)
 
 #endif // ENGRAM_ENABLE_SOURCE_INFO
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
 
 // ---------------------------------------------------------------------------
-// ENGRAM_EASY_POP: the untyped pop()
+// ENGRAM_TRACK_TYPE_SIZE: the untyped pop()
 // ---------------------------------------------------------------------------
 TEST_GROUP(EasyPop)
 {
@@ -1623,7 +1661,7 @@ TEST(EasyPop, WorksOnASlice)
     UNSIGNED_LONGS_EQUAL(0u, parent.used());
 }
 
-#endif // ENGRAM_EASY_POP
+#endif // ENGRAM_TRACK_TYPE_SIZE
 
 // ---------------------------------------------------------------------------
 // pop(T&): dispatching on what was pushed
@@ -1665,7 +1703,7 @@ TEST(PopDispatch, StringViewsRouteToPopString)
     auto a = arena::heap(4096);
 
     auto view = a.push_string(std::string_view{ "engram" });
-    UNSIGNED_LONGS_EQUAL(aligned(7), a.used());
+    UNSIGNED_LONGS_EQUAL(aligned(7 + kGuardSz), a.used());
 
     a.pop(view);
 
@@ -1707,7 +1745,7 @@ TEST(PopDispatch, UnwindsAMixedStackInReverse)
     auto many = a.push_array<Tracked>(2, 2);
     auto text = a.push_string(std::string_view{ "tail" });
 
-    const auto expected = aligned(sizeof(Tracked)) + aligned(2 * sizeof(Tracked)) + aligned(5);
+    const auto expected = aligned(sizeof(Tracked)) + aligned(2 * sizeof(Tracked) + kGuardSz) + aligned(5 + kGuardSz);
     UNSIGNED_LONGS_EQUAL(expected, a.used());
     LONGS_EQUAL(3, Tracked::constructed);
 

@@ -267,7 +267,7 @@ struct impl_data
     std::optional<std::pmr::monotonic_buffer_resource> m_pmr = std::nullopt;
 #endif
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     // One entry per push so pop() can rewind without being told what was pushed.
     struct push_record
     {
@@ -278,6 +278,19 @@ struct impl_data
     std::size_t m_push_depth = 0;
 #endif
 
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    // One entry per outstanding push: lets pop<T>/pop_array<T>/pop_string validate
+    // the type (RTTI) and size against what was pushed, and gives push/pop and the
+    // destructor a depth to assert an imbalance against.
+    struct diag_record
+    {
+        const char* type_name;
+        std::size_t type_size;
+    };
+    std::array<diag_record, ENGRAM_MAX_DIAG_DEPTH> m_diag_records{};
+    std::size_t m_diag_depth = 0;
+#endif
+
 #ifndef ENGRAM_DISABLE_SAVE_RESTORE
     // One entry per pending arena::save(); restore() rewinds to the newest one.
     struct save_point
@@ -286,8 +299,11 @@ struct impl_data
 #ifndef ENGRAM_DISABLE_TRACKING
         std::size_t count;
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
         std::size_t push_depth;
+#endif
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+        std::size_t diag_depth;
 #endif
     };
     std::array<save_point, ENGRAM_MAX_SAVE_STACKSZ> m_save_stack{};
@@ -1042,7 +1058,7 @@ std::byte* arena::reserve(std::size_t bytes, bool countable)
         return nullptr;
     }
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     // A full record stack fails the reservation rather than losing the record pop()
     // would need.
     if (countable && d.m_push_depth >= d.m_push_records.size())
@@ -1053,7 +1069,7 @@ std::byte* arena::reserve(std::size_t bytes, bool countable)
 #endif
 
     auto slot = d.m_ptr + d.m_offset;
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     if (countable)
         d.m_push_records[d.m_push_depth++] = { slot, d.m_offset };
 #endif
@@ -1067,7 +1083,7 @@ std::byte* arena::reserve(std::size_t bytes, bool countable)
         d.m_total++;
     }
 #endif
-#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_TRACK_TYPE_SIZE)
     (void)countable;
 #endif
     return slot;
@@ -1084,23 +1100,25 @@ std::byte* arena::unreserve(std::size_t bytes, bool countable)
     if (countable)
         --d.m_count;
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     if (countable && d.m_push_depth > 0)
         --d.m_push_depth;
 #endif
-#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_EASY_POP)
+#if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_TRACK_TYPE_SIZE)
     (void)countable;
 #endif
     return d.m_ptr + d.m_offset;
 }
 
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
 void arena::pop() noexcept
 {
     auto& d = *m_impl;
     assert(d.m_push_depth > 0 && "engram: pop() with nothing pushed");
     if (d.m_push_depth == 0)
         return;
+
+    ENGRAM_DIAG_POP_UNTYPED();
 
     const auto& record = d.m_push_records[--d.m_push_depth];
     assert(record.ptr == d.m_ptr + record.offset);
@@ -1117,6 +1135,34 @@ void arena::pop() noexcept
 }
 
 std::size_t arena::push_depth() const noexcept { return m_impl ? m_impl->m_push_depth : 0; }
+#endif
+
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+void arena::diag_push_record(const char* type_name, std::size_t type_size)
+{
+    auto& d = *m_impl;
+    if (d.m_diag_depth < d.m_diag_records.size())
+        d.m_diag_records[d.m_diag_depth] = { type_name, type_size };
+    ++d.m_diag_depth;
+}
+
+void arena::diag_pop_record(const char* type_name, std::size_t type_size)
+{
+    auto& d = *m_impl;
+    assert(d.m_diag_depth > 0 && "engram: pop with nothing pushed (imbalanced pop)");
+    if (d.m_diag_depth == 0)
+        return;
+
+    --d.m_diag_depth;
+    if (type_name && d.m_diag_depth < d.m_diag_records.size())
+    {
+        const auto& record = d.m_diag_records[d.m_diag_depth];
+        assert((!record.type_name || std::strcmp(record.type_name, type_name) == 0) &&
+            "engram: pop<T> type does not match the type that was pushed");
+        assert(record.type_size == type_size &&
+            "engram: pop<T> size does not match the type that was pushed");
+    }
+}
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1233,9 @@ arena::~arena()
         return;
 
     auto& d = *m_impl;
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    assert(d.m_diag_depth == 0 && "engram: arena destroyed with unpopped pushes (imbalanced pop)");
+#endif
     switch (d.m_type)
     {
         case memory_source::stack: if (d.m_ptr && d.m_clear_on_free) { memset(d.m_ptr, 0, d.m_high_water); } break;
@@ -1226,8 +1275,11 @@ void arena::reset() noexcept
 #ifndef ENGRAM_DISABLE_TRACKING
     d.m_count = 0;
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     d.m_push_depth = 0;
+#endif
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    d.m_diag_depth = 0;
 #endif
 #ifndef ENGRAM_DISABLE_SAVE_RESTORE
     d.m_save_stacksz = 0;
@@ -1249,8 +1301,11 @@ bool arena::save() noexcept
 #ifndef ENGRAM_DISABLE_TRACKING
     sp.count = d.m_count;
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     sp.push_depth = d.m_push_depth;
+#endif
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    sp.diag_depth = d.m_diag_depth;
 #endif
     return true;
 }
@@ -1270,8 +1325,11 @@ bool arena::restore() noexcept
 #ifndef ENGRAM_DISABLE_TRACKING
     d.m_count = sp.count;
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
     d.m_push_depth = sp.push_depth;
+#endif
+#ifdef ENGRAM_ENABLE_DIAGNOSTICS
+    d.m_diag_depth = sp.diag_depth;
 #endif
     return true;
 }

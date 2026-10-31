@@ -244,7 +244,7 @@ PYBIND11_MODULE(_engram, m)
         .def_property_readonly("save_depth", &arena::save_depth,
                                "Number of save points currently pending.")
 #endif
-#ifdef ENGRAM_EASY_POP
+#ifdef ENGRAM_TRACK_TYPE_SIZE
         .def("pop", [](arena& a) { a.pop(); },
              "Release the most recent push, whatever it was. Runs no destructors and "
              "zeroes the reclaimed bytes unless the arena was created with flags.no_clear.")

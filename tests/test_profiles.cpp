@@ -74,8 +74,8 @@ static_assert(!has_pmr<arena>::value, "ENGRAM_MINIMAL implies ENGRAM_DISABLE_PMR
 #ifndef ENGRAM_MASK_EXCEPTIONS
 #error "ENGRAM_MINIMAL must define ENGRAM_MASK_EXCEPTIONS"
 #endif
-#ifdef ENGRAM_EASY_POP
-#error "ENGRAM_MINIMAL must switch ENGRAM_EASY_POP off"
+#ifdef ENGRAM_TRACK_TYPE_SIZE
+#error "ENGRAM_MINIMAL must switch ENGRAM_TRACK_TYPE_SIZE off"
 #endif
 
 // One native GPU backend per platform survives; everything else is gone.
