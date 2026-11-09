@@ -87,6 +87,8 @@ PYBIND11_MODULE(_engram, m)
     flags.attr("read") = static_cast<int>(engram::flags::read);
     flags.attr("write") = static_cast<int>(engram::flags::write);
     flags.attr("avoid_false_sharing") = static_cast<int>(engram::flags::avoid_false_sharing);
+    flags.attr("expand") = static_cast<int>(engram::flags::expand);
+    flags.attr("expand_custom") = static_cast<int>(engram::flags::expand_custom);
 
     py::class_<arena>(m, "Arena")
         // ---- factories -----------------------------------------------------

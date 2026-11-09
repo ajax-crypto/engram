@@ -908,6 +908,337 @@ TEST(Partition, AvoidFalseSharingPaddingCanTipItOverTheEdge)
 }
 
 // ---------------------------------------------------------------------------
+// Growth (flags::expand / flags::expand_custom): a heap arena grows by linking
+// in another region instead of failing once the active one is full.
+// ---------------------------------------------------------------------------
+TEST_GROUP(Growth)
+{
+};
+
+TEST(Growth, WithoutExpandExhaustionFailsOutright)
+{
+    auto a = arena::create(memory_source::heap, kAlign * 2, flags::none);
+
+    auto first = a.push_array<std::byte>(kAlign);
+    auto second = a.push_array<std::byte>(kAlign);
+    (void)first; (void)second;
+
+    auto overflow = a.push_array<std::byte>(1);
+
+    CHECK_TRUE(overflow.empty());
+    LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
+    UNSIGNED_LONGS_EQUAL(kAlign * 2, a.capacity());
+}
+
+TEST(Growth, ExpandGrowsCapacityByAnotherRegionWhenFull)
+{
+    auto a = arena::create(memory_source::heap, kAlign * 2, flags::expand);
+    CHECK_TRUE(a.is_valid());
+    UNSIGNED_LONGS_EQUAL(kAlign * 2, a.capacity());
+
+    auto first = a.push_array<std::byte>(kAlign);
+    auto second = a.push_array<std::byte>(kAlign);
+    (void)first; (void)second;
+    UNSIGNED_LONGS_EQUAL(kAlign * 2, a.used());
+
+    // The region is exactly full; this grows a same-sized second region instead
+    // of failing.
+    auto& value = a.push<int>(7);
+
+    LONGS_EQUAL(7, value);
+    LONGS_EQUAL((long)arena_error::no_error, (long)a.error());
+    UNSIGNED_LONGS_EQUAL(kAlign * 4, a.capacity());
+    UNSIGNED_LONGS_EQUAL(kAlign * 3, a.used());
+}
+
+TEST(Growth, GrowthIsTriggeredEvenWhenTheTailIsOnlyPartiallyFull)
+{
+    // Leftover room smaller than one quantum still has to grow rather than
+    // silently fail or corrupt the next region.
+    auto regionSize = kAlign + (kAlign / 2);
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    auto first = a.push_array<std::byte>(1);
+    (void)first;
+    UNSIGNED_LONGS_EQUAL(kAlign, a.used());
+    UNSIGNED_LONGS_EQUAL(regionSize, a.capacity());
+
+    auto& value = a.push<std::byte>(std::byte{ 9 });
+    (void)value;
+
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+    UNSIGNED_LONGS_EQUAL(kAlign * 2, a.used());
+
+    // Neither region's leftover half-quantum is ever reclaimed by later pushes.
+    CHECK_TRUE(a.used() < a.capacity());
+}
+
+TEST(Growth, PopUnwindsBackAcrossARegionBoundaryToEmpty)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    a.push<int>(1);
+    a.push<int>(2);                 // fills region 1 exactly
+    auto& third = a.push<int>(3);   // grows into region 2
+    LONGS_EQUAL(3, third);
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+    UNSIGNED_LONGS_EQUAL(regionSize + kAlign, a.used());
+
+    a.pop<int>();   // region 2
+    a.pop<int>();   // region 1 (last)
+    a.pop<int>();   // region 1 (first)
+
+    CHECK_TRUE(a.empty());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity()); // regions stay allocated
+}
+
+TEST(Growth, DrainedRegionIsReusedOnTheNextGrowthInsteadOfAllocatingAgain)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    a.push<int>(1);
+    a.push<int>(2);
+    a.push<int>(3); // grows into region 2
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+
+    a.pop<int>();
+    a.pop<int>();
+    a.pop<int>();
+    CHECK_TRUE(a.empty());
+
+    // Refilling past the first region's boundary again reuses the already-linked
+    // region 2 rather than growing a third one.
+    a.push<int>(4);
+    a.push<int>(5);
+    a.push<int>(6);
+
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+}
+
+TEST(Growth, ContainsFindsPointersInEveryLinkedRegion)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    a.push<int>(1);
+    a.push<int>(2);
+    auto& grown = a.push<int>(3); // lives in region 2
+
+    CHECK_TRUE(a.contains(&grown));
+    CHECK_FALSE(a.contains(a.data().data() + a.capacity())); // past everything
+}
+
+TEST(Growth, DataOnlyCoversTheFirstRegion)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    a.push<int>(1);
+    a.push<int>(2);
+    a.push<int>(3); // grows
+
+    UNSIGNED_LONGS_EQUAL(regionSize, a.data().size());
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+}
+
+TEST(Growth, SliceLandsInASecondRegionViaTheOffsetAfterTheFirst)
+{
+    auto regionSize = kAlign * 4;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    auto fill = a.push_array<std::byte>(regionSize);
+    (void)fill;
+    UNSIGNED_LONGS_EQUAL(regionSize, a.used());
+
+    auto& marker = a.push<int>(55); // grows into region 2, at its offset 0
+
+    auto sub = a.slice(regionSize, kAlign);
+
+    CHECK_TRUE(sub.is_valid());
+    POINTERS_EQUAL(&marker, sub.data().data());
+}
+
+TEST(Growth, PartitionAlwaysFailsOnAGrowableArenaEvenWhenEverythingFits)
+{
+    auto a = arena::create(memory_source::heap, kAlign * 8, flags::expand);
+    std::size_t sizes[] = { kAlign, kAlign };
+    int calls = 0;
+
+    auto ok = a.partition(sizes, [&](arena&&) { ++calls; });
+
+    CHECK_FALSE(ok);
+    LONGS_EQUAL(0, calls);
+}
+
+TEST(Growth, CommitFlagStillWorksTogetherWithExpand)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand | flags::commit);
+    CHECK_TRUE(a.is_valid());
+
+    auto fill = a.push_array<std::byte>(regionSize);
+    (void)fill;
+    auto& grown = a.push<int>(5);
+
+    LONGS_EQUAL(5, grown);
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+}
+
+TEST(Growth, PinToPhysicalAppliesToEachGrownRegionWithoutFailing)
+{
+    // Locking pages can be refused (rlimit / privileges); growth must not fail
+    // because of it, and unpin() must still work across every linked region.
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand | flags::pin_to_physical);
+    CHECK_TRUE(a.is_valid());
+
+    auto fill = a.push_array<std::byte>(regionSize);
+    (void)fill;
+    auto& grown = a.push<int>(1);
+    (void)grown;
+
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+    a.unpin();
+}
+
+TEST(Growth, ResetReclaimsEveryRegionAndMovesTheTailBackToTheFirstOne)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    auto fill = a.push_array<std::byte>(regionSize);
+    (void)fill;
+    a.push<int>(1); // grows into region 2
+
+    a.reset();
+
+    CHECK_TRUE(a.empty());
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity()); // regions stay allocated, just emptied
+
+    // Filling past the first region's boundary again reuses region 2 instead of
+    // growing a third one.
+    auto refill = a.push_array<std::byte>(regionSize);
+    (void)refill;
+    a.push<int>(2);
+
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+}
+
+TEST(Growth, SaveRestoreAbandonsRegionsGrownAfterTheSavePoint)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    auto fill = a.push_array<std::byte>(regionSize); // fills region 1
+    (void)fill;
+    CHECK_TRUE(a.save());
+
+    a.push<int>(1); // grows into region 2
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+
+    CHECK_TRUE(a.restore());
+
+    UNSIGNED_LONGS_EQUAL(regionSize, a.used());         // back to exactly-full region 1
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity()); // region 2 stays linked, just emptied
+
+    // Growing again reuses region 2 rather than allocating a third one.
+    a.push<int>(2);
+    UNSIGNED_LONGS_EQUAL(regionSize * 2, a.capacity());
+}
+
+TEST(Growth, CapacityUsedAndRemainingAggregateAcrossSeveralRegions)
+{
+    constexpr std::size_t regionSize = kAlign * 2;
+    using Chunk = std::array<std::byte, regionSize>;
+
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    for (int i = 0; i < 5; ++i)
+    {
+        auto& chunk = a.push<Chunk>(); // each push exactly fills one whole region
+        (void)chunk;
+    }
+
+    LONGS_EQUAL((long)arena_error::no_error, (long)a.error());
+    UNSIGNED_LONGS_EQUAL(regionSize * 5, a.capacity());
+    UNSIGNED_LONGS_EQUAL(regionSize * 5, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.remaining());
+}
+
+TEST(Growth, ExpandCustomUsesTheCallbackForTheNextRegionsSize)
+{
+    auto a = arena::heap(4096, std::function<std::size_t(std::size_t)>(
+        [](std::size_t cur) { return cur * 2; }));
+    CHECK_TRUE(a.is_valid());
+    auto region1 = a.capacity();
+
+    auto fill = a.push_array<std::byte>(region1); // fills region 1 in one call
+    (void)fill;
+    auto& grown = a.push<int>(1);                  // grows into region 2
+    (void)grown;
+
+    UNSIGNED_LONGS_EQUAL(region1 + region1 * 2, a.capacity());
+}
+
+TEST(Growth, ExpandCustomReceivesTheCurrentRegionsSizeEachTime)
+{
+    std::vector<std::size_t> seen;
+    auto a = arena::heap(4096, std::function<std::size_t(std::size_t)>(
+        [&](std::size_t cur) { seen.push_back(cur); return cur * 2; }));
+    auto region1 = a.capacity();
+
+    auto fill1 = a.push_array<std::byte>(region1); // fills region 1
+    (void)fill1;
+    a.push<int>(1);                                 // grows into region 2 (cb sees region1)
+
+    auto region2 = a.capacity() - region1;
+    auto fill2 = a.push_array<std::byte>(region2 - aligned(sizeof(int))); // fills the rest of region 2
+    (void)fill2;
+    a.push<int>(2);                                 // grows into region 3 (cb sees region2)
+
+    UNSIGNED_LONGS_EQUAL(2u, seen.size());
+    UNSIGNED_LONGS_EQUAL(region1, seen[0]);
+    UNSIGNED_LONGS_EQUAL(region2, seen[1]);
+}
+
+TEST(Growth, ExpandCustomGrowthIsClampedToFitAnOversizedPushEvenIfTheCallbackReturnsLess)
+{
+    auto a = arena::heap(64, std::function<std::size_t(std::size_t)>(
+        [](std::size_t) { return 8; })); // deliberately too small
+    auto region1 = a.capacity();
+
+    auto fill = a.push_array<std::byte>(region1);
+    (void)fill;
+
+    // The callback says 8, but a push bigger than that still has to fit.
+    auto big = a.push_array<std::byte>(kAlign * 2);
+
+    CHECK_FALSE(big.empty());
+    UNSIGNED_LONGS_EQUAL(kAlign * 2, big.size());
+}
+
+TEST(Growth, FailedGrowthReportsAllocFailedWithoutCorruptingTheArena)
+{
+    auto a = arena::heap(4096, std::function<std::size_t(std::size_t)>(
+        [](std::size_t) { return ~std::size_t{ 0 } / 2; })); // an impossible region size
+    auto region1 = a.capacity();
+
+    auto fill = a.push_array<std::byte>(region1);
+    (void)fill;
+
+    auto overflow = a.push_array<int>(1);
+
+    CHECK_TRUE(overflow.empty());
+    LONGS_EQUAL((long)arena_error::alloc_failed, (long)a.error());
+    CHECK_TRUE(a.is_valid());
+    UNSIGNED_LONGS_EQUAL(region1, a.capacity());
+}
+
+// ---------------------------------------------------------------------------
 // Save / restore
 // ---------------------------------------------------------------------------
 TEST_GROUP(SaveRestore)
@@ -1659,6 +1990,25 @@ TEST(EasyPop, WorksOnASlice)
 
     UNSIGNED_LONGS_EQUAL(0u, sub.used());
     UNSIGNED_LONGS_EQUAL(0u, parent.used());
+}
+
+TEST(EasyPop, UntypedPopWorksAcrossAGrownRegionBoundary)
+{
+    auto regionSize = kAlign * 2;
+    auto a = arena::create(memory_source::heap, regionSize, flags::expand);
+
+    auto fill = a.push_array<std::byte>(regionSize); // fills region 1
+    (void)fill;
+    auto& grown = a.push<int>(9);                    // grows into region 2
+    (void)grown;
+    UNSIGNED_LONGS_EQUAL(2u, a.push_depth());
+
+    a.pop(); // rewinds the int in region 2
+    UNSIGNED_LONGS_EQUAL(regionSize, a.used());
+
+    a.pop(); // rewinds the push_array, back in region 1
+    UNSIGNED_LONGS_EQUAL(0u, a.used());
+    UNSIGNED_LONGS_EQUAL(0u, a.push_depth());
 }
 
 #endif // ENGRAM_TRACK_TYPE_SIZE

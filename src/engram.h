@@ -66,6 +66,7 @@
 #include <new>
 #include <array>
 #include <version>
+#include <functional>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -243,6 +244,16 @@ namespace flags
     /// `size + ENGRAM_FALSE_SHARING_PAD` bytes while the sub-arena's capacity stays `size`;
     /// adjacent slices never share a cache line.
     constexpr int32_t avoid_false_sharing = 512;
+    /// Heap arenas only: once the current region is full, grow by allocating another region
+    /// of the same size and linking it in (a doubly linked list of regions) instead of
+    /// failing. `push`/`pop` transparently work across regions; `slice` and `partition` do
+    /// not (see their docs). Trailing space in a region that a push doesn't fit in is wasted,
+    /// not reused. Ignored outside `memory_source::heap`.
+    constexpr int32_t expand = 1024;
+    /// Like `expand`, but each new region's size is computed by a caller-supplied callback
+    /// (see the `arena::heap` overload taking a `std::function<std::size_t(std::size_t)>`)
+    /// instead of reusing the original size. Set automatically by that overload.
+    constexpr int32_t expand_custom = 2048;
 
     constexpr int32_t read = 1;              ///< Cache-warm read intent (@ref warm_cache ioflags).
     constexpr int32_t write = 2;             ///< Cache-warm write intent (@ref warm_cache ioflags).
@@ -465,6 +476,15 @@ private:
     bool sync_va(std::size_t provided, ...);
     bool prefetch_va(std::size_t provided, ...);
 
+    // Byte offset of `ptr` from the start of the arena (spanning every linked region in
+    // order), for the templated warm_cache(T*, ...) overload. 0 if `ptr` isn't contained.
+    std::size_t offset_of(const void* ptr) const noexcept;
+
+    // `true` if this arena was created with flags::expand / flags::expand_custom
+    // (defined in engram.cpp). Used by `partition`, which growable arenas don't support
+    // since their regions aren't one contiguous block.
+    bool is_growable() const noexcept;
+
 public:
 	
 	/**
@@ -503,6 +523,21 @@ public:
     {
         return create(memory_source::heap, size, trueContiguous ? engram::flags::true_contiguous | engram::flags::page_aligned : engram::flags::page_aligned, alignment, fd ENGRAM_SOURCE_ARG);
     }
+
+    /**
+     * @brief Create a growable heap arena (`flags::expand_custom`): when the active region
+     * fills up, @p grow is called with that region's size and must return the size of the
+     * next region to allocate (always `>=` the size passed in). The new region is linked
+     * after the current one (a doubly linked list of regions); `push`/`pop` work across
+     * the whole chain, but `slice` only within one region and `partition` not at all.
+     * @param size           Capacity in bytes of the first region.
+     * @param grow           Called with the current region's size; returns the next one's.
+     * @param trueContiguous Request contiguous / huge-page memory (per region).
+     * @param alignment      Minimum alignment (per region).
+     * @param fd             Optional file descriptor for a file-backed first region.
+     */
+    [[nodiscard]] static arena heap(std::size_t size, std::function<std::size_t(std::size_t)> grow, bool trueContiguous = false,
+        std::size_t alignment = alignof(std::max_align_t), int fd = -1 ENGRAM_SOURCE_PARAM);
 
 #ifdef __linux__
     /**
@@ -966,8 +1001,8 @@ public:
     template <typename T>
     void warm_cache(T* ptr, cache_locality locality, int32_t ioflags)
     {
-        if (auto base = base_ptr())
-            warm_cache(locality, ioflags, (std::size_t)((std::byte*)ptr - base), sizeof(T));
+        if (is_valid())
+            warm_cache(locality, ioflags, offset_of(ptr), sizeof(T));
     }
 
     bool is_valid() const noexcept;        ///< @return `true` if the arena holds valid storage.
@@ -988,15 +1023,19 @@ public:
 
     /**
      * @brief Access the arena's underlying storage as a contiguous byte range.
-     * @return A `std::span<std::byte>` over the whole managed block `[base, capacity)`,
-     *         or an empty span if the arena holds no storage.
+     * @return A `std::span<std::byte>` over the first region's managed block
+     *         `[base, capacity)`, or an empty span if the arena holds no storage. For a
+     *         growable (`flags::expand`/`expand_custom`) arena that has grown, this only
+     *         covers the first region — the regions are separate allocations and are not
+     *         contiguous with one another, so no single span can cover all of them; use
+     *         @ref contains / @ref capacity for whole-arena queries instead.
      */
     std::span<std::byte> data() const noexcept;
 
     /**
      * @brief Check whether @p ptr falls within this arena's storage.
      * @param ptr Pointer to test; `nullptr` always returns `false`.
-     * @return `true` if @p ptr lies in `[data().data(), data().data() + capacity())`.
+     * @return `true` if @p ptr lies within any of this arena's regions (see @ref flags::expand).
      */
     bool contains(const void* ptr) const noexcept;
 
@@ -1008,6 +1047,12 @@ public:
      * destroying it leaves the parent untouched. This lets you hand an independent
      * slice to a child function or a worker thread with no extra allocation. The
      * caller is responsible for choosing non-overlapping regions.
+     *
+     * For a growable (`flags::expand`/`expand_custom`) arena, `start` is a logical offset
+     * spanning every region in order, but `[start, start + size)` (plus any
+     * `avoid_false_sharing` padding) must land inside a single region — regions are
+     * separate allocations, so a slice straddling two of them cannot be a single
+     * contiguous span. Asserts if it does.
      * @param start Byte offset of the region within this arena.
      * @param size  Size of the region in bytes.
      * @param flags @ref flags controlling initialisation: the region is zeroed by
@@ -1030,16 +1075,22 @@ public:
      * resulting sub-arena in order so it can move it wherever it needs to go (a
      * container, a thread's capture list, …). Nothing is sliced and @p func is never
      * called unless every requested size (plus any padding) fits: the whole call is
-     * all-or-nothing.
+     * all-or-nothing. Not supported on a growable (`flags::expand`/`expand_custom`)
+     * arena — its regions aren't one contiguous block, so back-to-back slicing across
+     * all of @p sizes can't be guaranteed up front; always returns `false` for one.
      * @param sizes Size in bytes of each requested sub-arena, in order.
      * @param func  Called as `func(arena&&)` once per entry of @p sizes, in order.
      * @param flags @ref flags applied to every sub-arena (see the single-region @ref slice).
-     * @return `false` without calling @p func at all if the sum of @p sizes (plus any
-     *         `avoid_false_sharing` padding) exceeds this arena's capacity; `true` otherwise.
+     * @return `false` without calling @p func at all if this arena is growable, or if the
+     *         sum of @p sizes (plus any `avoid_false_sharing` padding) exceeds its capacity;
+     *         `true` otherwise.
      */
     template <typename FuncT>
     [[nodiscard]] bool partition(std::span<const std::size_t> sizes, FuncT&& func, int32_t flags = 0 ENGRAM_SOURCE_PARAM)
     {
+        if (is_growable())
+            return false;
+
         auto pad = (flags & engram::flags::avoid_false_sharing) ? ENGRAM_FALSE_SHARING_PAD : 0;
         std::size_t total = 0;
         for (auto len : sizes)

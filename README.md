@@ -266,9 +266,69 @@ Behavior is tuned with the `int32_t` constants in the `engram::flags` namespace
 | `flags::pin_to_physical` | Lock the pages into RAM (`mlock` / `VirtualLock`).  |
 | `flags::unified`         | Unified / shareable memory: `memfd` on the Linux heap; managed memory (`cudaMallocManaged` / `hipMallocManaged`) for CUDA / ROCm. |
 | `flags::avoid_false_sharing` | `arena::slice` / `arena::partition` only: additionally reserve `ENGRAM_FALSE_SHARING_PAD` bytes beyond each requested size, unused, so adjacent slices can't share a cache line — see [Slicing](#slicing-sub-arenas). |
+| `flags::expand`          | Heap arenas only: grow by linking in another region instead of failing once the active one is full — see [Growing an arena](#growing-an-arena). |
+| `flags::expand_custom`   | Like `flags::expand`, but a callback sizes each new region — see [Growing an arena](#growing-an-arena). Set automatically by the `arena::heap` overload that takes one. |
 
 By default an arena scrubs (zeroes) its memory when it is destroyed; pass
 `flags::no_clear` to skip that.
+
+### Growing an arena
+
+A plain heap arena is a single fixed-size block: once it is full, further pushes
+fail (`push_array`/`push_string` return empty, `push<T>` aborts). `flags::expand`
+turns that failure into growth instead — when the active region can't satisfy a
+push, the arena allocates **another region of the same size** and links it to the
+first with a doubly linked list, and `push`/`pop` keep working transparently across
+every region in the chain:
+
+```cpp
+auto a = arena::create(memory_source::heap, 1 << 20, engram::flags::expand);
+
+for (int i = 0; i < 10'000; ++i)
+{
+    auto& frame = a.push<Frame>();   // still succeeds once growth passes the first 1 MiB
+    (void)frame;
+}
+```
+
+`flags::expand_custom` is the same idea with a caller-chosen growth policy instead
+of "same size again": use the `arena::heap` overload that takes a
+`std::function<std::size_t(std::size_t)>`. It is called with the size of the
+region that just filled up and must return the size of the next one (always
+`>=` the size it was given):
+
+```cpp
+// Start at 64 KiB, double every time growth is needed.
+auto a = arena::heap(64 * 1024, [](std::size_t current) { return current * 2; });
+```
+
+A few things follow from regions being independent allocations rather than one
+contiguous block:
+
+- **Wasted tail space is expected.** If a push doesn't fit what's left in the
+  active region, growth happens even if that leftover is non-trivial; it is never
+  backfilled by later, smaller pushes. This trades some memory for O(1) growth
+  without ever moving (and invalidating pointers into) already-pushed data.
+- **`arena::partition` doesn't support a growable arena** — it always returns
+  `false` without calling its callback, since it can't guarantee a contiguous
+  back-to-back carve-up across region boundaries. Plain `arena::slice` still
+  works, but `[start, start + size)` must land inside a single region (`start` is
+  a logical offset spanning every region in order); a request that straddles two
+  of them is a usage error, same as an out-of-range one.
+- **`contains(ptr)` searches every linked region**, so it still reports `true` for
+  a pointer the growth put in a later region. `data()`, however, still returns
+  only the **first** region's span — regions are separate allocations with no
+  guaranteed relationship to one another's address, so no single `std::span` can
+  cover a grown arena. `capacity()`, `used()`, and `remaining()` do aggregate over
+  every region.
+- **Per-region flags, not whole-arena ones.** `flags::true_contiguous`,
+  `flags::pin_to_physical`, and `flags::commit` are replayed for every new region
+  as it is allocated, so contiguity/pinning/zeroing are properties of each region
+  individually, not a guarantee spanning the whole arena. `unpin()` releases every
+  region.
+- **Heap arenas only.** Stack arenas, `memory_source::external`/`custom` arenas,
+  and the freestanding single header do not support growth — `flags::expand` /
+  `flags::expand_custom` are ignored (or simply unavailable) everywhere else.
 
 ## Using an Arena
 
@@ -439,6 +499,11 @@ from this arena. It is bounds-only: it does not check alignment or that `ptr`
 lands on an allocation boundary. `nullptr` and an arena with no storage (`!is_valid()`)
 always return `false`.
 
+On a growable arena (see [Growing an arena](#growing-an-arena)), `contains`
+searches every linked region, and `capacity()`/`used()`/`remaining()` aggregate
+over all of them — but `data()` still only covers the first region, since later
+ones are separate allocations with no guaranteed contiguity to it.
+
 > `arena` is **move-only**: the copy constructor and copy assignment are deleted,
 so ownership of the underlying memory is never accidentally duplicated.
 
@@ -513,6 +578,11 @@ size)`; destroying it leaves the parent (and its memory) untouched, so no extra
 allocation or ownership transfer is involved. The region is zeroed by default;
 pass `flags::no_clear` to skip that. You pick the (non-overlapping) regions.
 
+> On a growable arena (see [Growing an arena](#growing-an-arena)), `start` is a
+> logical offset spanning every linked region in order, but `[start, start + size)`
+> must land inside a single one of them — regions are separate allocations, so a
+> slice straddling two can't be a contiguous span.
+
 Adjacent sub-arenas used by different threads can suffer **false sharing**: if
 one thread's bytes and the next thread's bytes land on the same CPU cache line,
 writes to one bounce the line out of the other core's cache even though the
@@ -571,6 +641,11 @@ anywhere. The call is **all-or-nothing**: if the sum of `sizes` (plus any
 `flags::avoid_false_sharing` padding) doesn't fit the parent's capacity,
 `partition` returns `false` without slicing anything or calling `func` at all;
 otherwise every slice is made, `func` runs once per entry, and it returns `true`.
+
+> `partition` always returns `false` (and never calls `func`) on a growable arena
+> (see [Growing an arena](#growing-an-arena)) — its regions aren't one contiguous
+> block, so a back-to-back carve-up across all of `sizes` can't be guaranteed.
+> Plain `slice` still works region-by-region.
 
 ```cpp
 auto pool = arena::heap(4 << 20);                      // 4 MiB backing block
@@ -1071,6 +1146,7 @@ uses `ENGRAM_FREESTANDING_STACKSZ` instead of asking the OS.
 | -------------------------------------------------- | -------------------------------------- | ------------------------------- |
 | `arena::heap`, `arena::heapfile`, `memory_source::heap`, `memory_source::custom` | No heap, no OS, no device backends. | Header + source build          |
 | `flags::heap_fallback`, `page_aligned`, `true_contiguous`, `shared`, `pin_to_physical`, and `arena::unpin()` | Heap / OS paging only. | Header + source build |
+| `flags::expand`, `flags::expand_custom`, and the `arena::heap` growth-callback overload | Growth is a heap-arena feature. | Header + source build |
 | `arena::create`, `arena::create_custom`, and every `arena::create_<vendor>` factory | No vendor runtimes.    | Header + source build          |
 | `arena::sync(...)` / `arena::prefetch(...)`, and the free `engram::prefetch` | Device runtimes and OS paging. | Header + source build  |
 | `arena::get_pmr_resource(...)`                     | Implied `ENGRAM_DISABLE_PMR`.          | Header + source build          |

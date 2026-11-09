@@ -6,10 +6,8 @@
 
 #include <cstdarg>
 #include <tuple>
-
-#ifndef ENGRAM_DISABLE_PMR
 #include <optional>
-#endif
+#include <functional>
 
 #include <tuple>
 #include <unordered_map>
@@ -263,6 +261,23 @@ struct impl_data
     arena_error m_error = arena_error::no_error;
     std::size_t m_alignment = alignof(std::max_align_t);
 
+    // --- Region growth (heap arenas only; flags::expand / flags::expand_custom) ---
+    // This struct doubles as one region's own bookkeeping (m_ptr/m_offset/m_size/
+    // m_high_water/m_alignment/m_use_sys_free describe *this* region) and, additionally
+    // for the head node (the one `arena::m_impl` always points to), the whole arena's
+    // aggregate state above/below. Regions are linked in creation order; m_tail (head
+    // only) is the currently-active region new reservations bump-allocate from.
+    impl_data* m_next = nullptr;
+    impl_data* m_prev = nullptr;
+    impl_data* m_tail = this;
+    // Raw base pointer of the linked list's front (head) region, cached on every node
+    // (not just the head) so any region can report the arena's overall base address
+    // without indirecting through m_prev back to the head.
+    void* m_front_ptr = nullptr;
+    bool m_expand = false;
+    int32_t m_region_flags = 0;
+    std::optional<std::function<std::size_t(std::size_t)>> m_grow_fn = std::nullopt;
+
 #ifndef ENGRAM_DISABLE_PMR
     std::optional<std::pmr::monotonic_buffer_resource> m_pmr = std::nullopt;
 #endif
@@ -271,6 +286,7 @@ struct impl_data
     // One entry per push so pop() can rewind without being told what was pushed.
     struct push_record
     {
+        impl_data* region;
         std::byte* ptr;
         std::size_t offset;
     };
@@ -295,6 +311,7 @@ struct impl_data
     // One entry per pending arena::save(); restore() rewinds to the newest one.
     struct save_point
     {
+        impl_data* region;
         std::size_t offset;
 #ifndef ENGRAM_DISABLE_TRACKING
         std::size_t count;
@@ -695,6 +712,86 @@ static void heap_free(impl_data& arena)
 }
 
 // ---------------------------------------------------------------------------
+// Region growth (flags::expand / flags::expand_custom; heap arenas only). Each
+// region is its own OS allocation linked front-to-back off the head impl_data that
+// `arena::m_impl` points to; see the struct's comment above for the node layout.
+// ---------------------------------------------------------------------------
+
+// Translates a logical offset spanning every region (as used by slice/prefetch/
+// warm_cache/PMR) into the region that owns it, rewriting `offset` to be relative
+// to that region's own base. Returns nullptr if `offset` runs past the last region.
+static impl_data* locate_region(impl_data& head, std::size_t& offset)
+{
+    auto* region = &head;
+    while (region && offset >= region->m_size)
+    {
+        offset -= region->m_size;
+        region = region->m_next;
+    }
+    return region;
+}
+
+// Called when the active (tail) region can't satisfy a `rounded`-byte reservation.
+// Reuses a region already linked ahead of the tail (left behind, drained to empty, by
+// pop()/restore() unwinding past a region boundary) before asking the OS for a new one.
+static impl_data* grow_region(impl_data& head, std::size_t rounded)
+{
+    if (!head.m_expand || head.m_type != memory_source::heap)
+        return nullptr;
+
+    auto* tail = head.m_tail;
+    if (tail->m_next)
+    {
+        if (rounded <= tail->m_next->m_size)
+        {
+            head.m_tail = tail->m_next;
+            return head.m_tail;
+        }
+
+        // A region left behind by an earlier pop/restore is too small for this
+        // request; drop it so a right-sized one can take its place.
+        auto* stale = tail->m_next;
+        tail->m_next = stale->m_next;
+        if (stale->m_next)
+            stale->m_next->m_prev = tail;
+        heap_free(*stale);
+        delete stale;
+    }
+
+    auto new_size = head.m_grow_fn.has_value() ? (*head.m_grow_fn)(tail->m_size) : tail->m_size;
+    if (new_size < rounded)
+        new_size = rounded; // the policy must grow, but a single over-sized push still has to fit
+
+    auto region_flags = head.m_region_flags;
+    if (region_flags & engram::flags::page_aligned)
+    {
+        auto pagesz = get_page_size();
+        new_size = ((new_size + pagesz - 1) / pagesz) * pagesz;
+    }
+
+    auto* region = new impl_data();
+    std::tie(region->m_ptr, region->m_use_sys_free) = heap_allocate_impl(new_size, region_flags, head.m_alignment);
+    if (!region->m_ptr)
+    {
+        delete region;
+        return nullptr;
+    }
+
+    region->m_size = new_size;
+    region->m_alignment = head.m_alignment;
+    region->m_type = memory_source::heap;
+    region->m_clear_on_free = head.m_clear_on_free;
+    region->m_front_ptr = head.m_front_ptr;
+    if (region_flags & engram::flags::commit)
+        memset(region->m_ptr, 0, new_size);
+
+    region->m_prev = tail;
+    tail->m_next = region;
+    head.m_tail = region;
+    return region;
+}
+
+// ---------------------------------------------------------------------------
 // General-purpose (backend-agnostic) prefetch helpers.
 // ---------------------------------------------------------------------------
 void warm_cache(std::byte* ptr, std::size_t size, cache_locality locality, int32_t ioflags)
@@ -778,6 +875,14 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
             // A reserve_only range isn't backed/accessible yet, so it can't be zeroed here.
             if ((flags & engram::flags::commit) && !(flags & engram::flags::reserve_only))
                 memset(d.m_ptr, 0, size);
+
+            d.m_front_ptr = d.m_ptr;
+            if (flags & (engram::flags::expand | engram::flags::expand_custom))
+            {
+                d.m_expand = true;
+                // Replayed for every later region; growth never needs its own fd/reserve_only.
+                d.m_region_flags = flags & ~(engram::flags::expand | engram::flags::expand_custom | engram::flags::reserve_only);
+            }
         }
         else d.m_error = arena_error::alloc_failed;
     }
@@ -787,6 +892,17 @@ arena arena::create(memory_source type, std::size_t size, int32_t flags, std::si
         d.m_error = arena_error::alloc_failed;
     }
 
+    return result;
+}
+
+/** @copydoc arena::heap(std::size_t, std::function<std::size_t(std::size_t)>, bool, std::size_t, int) */
+arena arena::heap(std::size_t size, std::function<std::size_t(std::size_t)> grow, bool trueContiguous, std::size_t alignment, int fd ENGRAM_SOURCE_DECL)
+{
+    auto result = create(memory_source::heap, size,
+        (trueContiguous ? engram::flags::true_contiguous : 0) | engram::flags::page_aligned | engram::flags::expand_custom,
+        alignment, fd ENGRAM_SOURCE_ARG);
+    if (result.m_impl->m_ptr)
+        result.m_impl->m_grow_fn = std::move(grow);
     return result;
 }
 
@@ -1006,6 +1122,7 @@ arena arena::make_external(std::byte* storage, std::size_t size, int32_t flags E
     d.m_type = memory_source::external;
     d.m_size = size;
     d.m_clear_on_free = !(flags & engram::flags::no_clear);
+    d.m_front_ptr = storage;
     if (storage && (flags & engram::flags::commit))
         memset(storage, 0, size);
     return result;
@@ -1050,37 +1167,43 @@ std::byte* arena::base_ptr() const
 std::byte* arena::reserve(std::size_t bytes, bool countable)
 {
     assert(m_impl && "engram: cannot allocate from a moved-from arena");
-    auto& d = *m_impl;
+    auto& head = *m_impl;
     auto rounded = align_up_max(bytes);
-    if (!d.m_ptr || rounded > d.m_size - d.m_offset)
+
+    auto* region = head.m_tail;
+    if (!region->m_ptr || rounded > region->m_size - region->m_offset)
     {
-        d.m_error = arena_error::alloc_failed;
-        return nullptr;
+        region = grow_region(head, rounded);
+        if (!region)
+        {
+            head.m_error = arena_error::alloc_failed;
+            return nullptr;
+        }
     }
 
 #ifdef ENGRAM_TRACK_TYPE_SIZE
     // A full record stack fails the reservation rather than losing the record pop()
     // would need.
-    if (countable && d.m_push_depth >= d.m_push_records.size())
+    if (countable && head.m_push_depth >= head.m_push_records.size())
     {
-        d.m_error = arena_error::alloc_failed;
+        head.m_error = arena_error::alloc_failed;
         return nullptr;
     }
 #endif
 
-    auto slot = d.m_ptr + d.m_offset;
+    auto slot = region->m_ptr + region->m_offset;
 #ifdef ENGRAM_TRACK_TYPE_SIZE
     if (countable)
-        d.m_push_records[d.m_push_depth++] = { slot, d.m_offset };
+        head.m_push_records[head.m_push_depth++] = { region, slot, region->m_offset };
 #endif
-    d.m_offset += rounded;
-    if (d.m_offset > d.m_high_water)
-        d.m_high_water = d.m_offset;
+    region->m_offset += rounded;
+    if (region->m_offset > region->m_high_water)
+        region->m_high_water = region->m_offset;
 #ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
     {
-        d.m_count++;
-        d.m_total++;
+        head.m_count++;
+        head.m_total++;
     }
 #endif
 #if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_TRACK_TYPE_SIZE)
@@ -1091,46 +1214,57 @@ std::byte* arena::reserve(std::size_t bytes, bool countable)
 
 std::byte* arena::unreserve(std::size_t bytes, bool countable)
 {
-    auto& d = *m_impl;
+    auto& head = *m_impl;
     auto rounded = align_up_max(bytes);
-    assert(rounded <= d.m_offset);
 
-    d.m_offset -= rounded;
+    // A push never straddles two regions (it either fits the active one or grows a
+    // new one sized to fit it wholesale), so its matching pop is always containable
+    // in exactly one region too — fall back to the previous one if the active region
+    // was already fully drained by an earlier pop.
+    auto* region = head.m_tail;
+    while (region->m_prev && rounded > region->m_offset)
+        region = region->m_prev;
+    head.m_tail = region;
+
+    assert(rounded <= region->m_offset);
+    region->m_offset -= rounded;
 #ifndef ENGRAM_DISABLE_TRACKING
     if (countable)
-        --d.m_count;
+        --head.m_count;
 #endif
 #ifdef ENGRAM_TRACK_TYPE_SIZE
-    if (countable && d.m_push_depth > 0)
-        --d.m_push_depth;
+    if (countable && head.m_push_depth > 0)
+        --head.m_push_depth;
 #endif
 #if defined(ENGRAM_DISABLE_TRACKING) && !defined(ENGRAM_TRACK_TYPE_SIZE)
     (void)countable;
 #endif
-    return d.m_ptr + d.m_offset;
+    return region->m_ptr + region->m_offset;
 }
 
 #ifdef ENGRAM_TRACK_TYPE_SIZE
 void arena::pop() noexcept
 {
-    auto& d = *m_impl;
-    assert(d.m_push_depth > 0 && "engram: pop() with nothing pushed");
-    if (d.m_push_depth == 0)
+    auto& head = *m_impl;
+    assert(head.m_push_depth > 0 && "engram: pop() with nothing pushed");
+    if (head.m_push_depth == 0)
         return;
 
     ENGRAM_DIAG_POP_UNTYPED();
 
-    const auto& record = d.m_push_records[--d.m_push_depth];
-    assert(record.ptr == d.m_ptr + record.offset);
+    const auto& record = head.m_push_records[--head.m_push_depth];
+    auto* region = record.region;
+    assert(region && record.ptr == region->m_ptr + record.offset);
 
     // Device storage may not be addressable from the host, so never memset it here.
-    if (d.m_ptr && d.m_clear_on_free && (d.m_type != memory_source::custom) && (d.m_offset > record.offset))
-        memset(d.m_ptr + record.offset, 0, d.m_offset - record.offset);
+    if (region->m_ptr && head.m_clear_on_free && (head.m_type != memory_source::custom) && (region->m_offset > record.offset))
+        memset(region->m_ptr + record.offset, 0, region->m_offset - record.offset);
 
-    d.m_offset = record.offset;
+    region->m_offset = record.offset;
+    head.m_tail = region;
 #ifndef ENGRAM_DISABLE_TRACKING
-    if (d.m_count > 0)
-        --d.m_count;
+    if (head.m_count > 0)
+        --head.m_count;
 #endif
 }
 
@@ -1167,13 +1301,54 @@ void arena::diag_pop_record(const char* type_name, std::size_t type_size)
 
 // ---------------------------------------------------------------------------
 // Introspection accessors. A moved-from arena has no impl, and must still read
-// as an empty arena rather than dereferencing a null pointer.
+// as an empty arena rather than dereferencing a null pointer. Capacity/used/empty/
+// contains fold in every linked region so a growable arena reports its true total.
 // ---------------------------------------------------------------------------
 bool arena::is_valid() const noexcept { return m_impl && m_impl->m_ptr != nullptr; }
-bool arena::empty() const noexcept { return !m_impl || m_impl->m_offset == 0; }
-std::size_t arena::used() const noexcept { return m_impl ? m_impl->m_offset : 0; }
-std::size_t arena::capacity() const noexcept { return m_impl ? m_impl->m_size : 0; }
-std::size_t arena::remaining() const noexcept { return m_impl ? m_impl->m_size - m_impl->m_offset : 0; }
+bool arena::is_growable() const noexcept { return m_impl && m_impl->m_expand; }
+
+std::size_t arena::offset_of(const void* ptr) const noexcept
+{
+    if (!m_impl || !ptr)
+        return 0;
+    auto p = reinterpret_cast<const std::byte*>(ptr);
+    std::size_t base = 0;
+    for (auto* r = m_impl; r; r = r->m_next)
+    {
+        if (r->m_ptr && p >= r->m_ptr && p < r->m_ptr + r->m_size)
+            return base + (std::size_t)(p - r->m_ptr);
+        base += r->m_size;
+    }
+    return 0;
+}
+
+bool arena::empty() const noexcept
+{
+    if (!m_impl)
+        return true;
+    for (auto* r = m_impl; r; r = r->m_next)
+        if (r->m_offset != 0)
+            return false;
+    return true;
+}
+
+std::size_t arena::used() const noexcept
+{
+    std::size_t total = 0;
+    for (auto* r = m_impl; r; r = r->m_next)
+        total += r->m_offset;
+    return total;
+}
+
+std::size_t arena::capacity() const noexcept
+{
+    std::size_t total = 0;
+    for (auto* r = m_impl; r; r = r->m_next)
+        total += r->m_size;
+    return total;
+}
+
+std::size_t arena::remaining() const noexcept { return m_impl ? capacity() - used() : 0; }
 #ifndef ENGRAM_DISABLE_TRACKING
 std::size_t arena::count() const noexcept { return m_impl ? m_impl->m_count : 0; }
 std::size_t arena::total() const noexcept { return m_impl ? m_impl->m_total : 0; }
@@ -1201,15 +1376,18 @@ std::span<std::byte> arena::data() const noexcept
 
 bool arena::contains(const void* ptr) const noexcept
 {
-    if (!m_impl || !m_impl->m_ptr || !ptr)
+    if (!m_impl || !ptr)
         return false;
     auto p = reinterpret_cast<const std::byte*>(ptr);
-    return p >= m_impl->m_ptr && p < m_impl->m_ptr + m_impl->m_size;
+    for (auto* r = m_impl; r; r = r->m_next)
+        if (r->m_ptr && p >= r->m_ptr && p < r->m_ptr + r->m_size)
+            return true;
+    return false;
 }
 
 arena arena::slice(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOURCE_DECL)
 {
-    auto& d = *m_impl;
+    auto& head = *m_impl;
 
     // avoid_false_sharing reserves ENGRAM_FALSE_SHARING_PAD extra bytes beyond
     // `size` in the parent as an unused guard; the sub-arena's capacity is still
@@ -1217,14 +1395,21 @@ arena arena::slice(std::size_t start, std::size_t size, int32_t flags ENGRAM_SOU
     auto reserved = size;
     if (flags & engram::flags::avoid_false_sharing)
         reserved += ENGRAM_FALSE_SHARING_PAD;
-    assert((start + reserved) <= d.m_size);
+
+    // `start` is a logical offset spanning every region in order; translate it to
+    // the region that actually owns it. Growth means regions are separate
+    // allocations, so the requested span must not straddle two of them.
+    auto local_start = start;
+    auto* region = locate_region(head, local_start);
+    assert(region && (local_start + reserved) <= region->m_size &&
+        "engram: slice must land inside a single region of a growable arena");
 
     // Zero the whole reserved region (guard bytes included) up front, then hand
     // back an external view sized to just the requested bytes.
     if (!(flags & engram::flags::no_clear))
-        memset(d.m_ptr + start, 0, reserved);
+        memset(region->m_ptr + local_start, 0, reserved);
 
-    return make_external(d.m_ptr + start, size, engram::flags::no_clear ENGRAM_SOURCE_ARG);
+    return make_external(region->m_ptr + local_start, size, engram::flags::no_clear ENGRAM_SOURCE_ARG);
 }
 
 arena::~arena()
@@ -1239,7 +1424,17 @@ arena::~arena()
     switch (d.m_type)
     {
         case memory_source::stack: if (d.m_ptr && d.m_clear_on_free) { memset(d.m_ptr, 0, d.m_high_water); } break;
-        case memory_source::heap: heap_free(d); break;
+        case memory_source::heap:
+            // Free every linked region; the head node itself is `delete`d below with m_impl.
+            for (auto* r = &d; r; )
+            {
+                auto* next = r->m_next;
+                heap_free(*r);
+                if (r != &d)
+                    delete r;
+                r = next;
+            }
+            break;
         case memory_source::external: break;
         case memory_source::custom: if (d.m_extra) ((void(*)(impl_data&))d.m_extra)(d); break;
     }
@@ -1251,85 +1446,100 @@ arena::~arena()
 #ifndef ENGRAM_DISABLE_PMR
 std::pmr::monotonic_buffer_resource& arena::get_pmr_resource(std::pmr::memory_resource* upstream)
 {
-    auto& d = *m_impl;
-    if (!d.m_pmr.has_value())
-        d.m_pmr.emplace(d.m_ptr + d.m_offset, d.m_size - d.m_offset, upstream);
-    return d.m_pmr.value();
+    auto& head = *m_impl;
+    auto& region = *head.m_tail;
+    if (!head.m_pmr.has_value())
+        head.m_pmr.emplace(region.m_ptr + region.m_offset, region.m_size - region.m_offset, upstream);
+    return head.m_pmr.value();
 }
 
 std::pmr::monotonic_buffer_resource& arena::get_pmr_resource(std::size_t start, std::size_t size, 
     std::pmr::memory_resource* upstream)
 {
-    auto& d = *m_impl;
-    assert((start + size) <= d.m_size);
-    if (!d.m_pmr.has_value())
-        d.m_pmr.emplace(d.m_ptr + start, size, upstream);
-    return d.m_pmr.value();
+    auto& head = *m_impl;
+    auto local_start = start;
+    auto* region = locate_region(head, local_start);
+    assert(region && (local_start + size) <= region->m_size &&
+        "engram: PMR sub-range must land inside a single region of a growable arena");
+    if (!head.m_pmr.has_value())
+        head.m_pmr.emplace(region->m_ptr + local_start, size, upstream);
+    return head.m_pmr.value();
 }
 #endif
 
 void arena::reset() noexcept
 {
-    auto& d = *m_impl;
-    d.m_offset = 0;
+    auto& head = *m_impl;
+    for (auto* r = &head; r; r = r->m_next)
+        r->m_offset = 0;
+    head.m_tail = &head;
 #ifndef ENGRAM_DISABLE_TRACKING
-    d.m_count = 0;
+    head.m_count = 0;
 #endif
 #ifdef ENGRAM_TRACK_TYPE_SIZE
-    d.m_push_depth = 0;
+    head.m_push_depth = 0;
 #endif
 #ifdef ENGRAM_ENABLE_DIAGNOSTICS
-    d.m_diag_depth = 0;
+    head.m_diag_depth = 0;
 #endif
 #ifndef ENGRAM_DISABLE_SAVE_RESTORE
-    d.m_save_stacksz = 0;
+    head.m_save_stacksz = 0;
 #endif
 #ifndef ENGRAM_DISABLE_PMR
-    d.m_pmr.reset();
+    head.m_pmr.reset();
 #endif
 }
 
 #ifndef ENGRAM_DISABLE_SAVE_RESTORE
 bool arena::save() noexcept
 {
-    auto& d = *m_impl;
-    if (d.m_save_stacksz >= d.m_save_stack.size())
+    auto& head = *m_impl;
+    if (head.m_save_stacksz >= head.m_save_stack.size())
         return false;
 
-    auto& sp = d.m_save_stack[d.m_save_stacksz++];
-    sp.offset = d.m_offset;
+    auto& sp = head.m_save_stack[head.m_save_stacksz++];
+    sp.region = head.m_tail;
+    sp.offset = head.m_tail->m_offset;
 #ifndef ENGRAM_DISABLE_TRACKING
-    sp.count = d.m_count;
+    sp.count = head.m_count;
 #endif
 #ifdef ENGRAM_TRACK_TYPE_SIZE
-    sp.push_depth = d.m_push_depth;
+    sp.push_depth = head.m_push_depth;
 #endif
 #ifdef ENGRAM_ENABLE_DIAGNOSTICS
-    sp.diag_depth = d.m_diag_depth;
+    sp.diag_depth = head.m_diag_depth;
 #endif
     return true;
 }
 
 bool arena::restore() noexcept
 {
-    auto& d = *m_impl;
-    if (d.m_save_stacksz == 0)
+    auto& head = *m_impl;
+    if (head.m_save_stacksz == 0)
         return false;
 
-    const auto& sp = d.m_save_stack[--d.m_save_stacksz];
-    // Device storage may not be addressable from the host, so never memset it here.
-    if (d.m_ptr && d.m_clear_on_free && (d.m_type != memory_source::custom) && (d.m_offset > sp.offset))
-        memset(d.m_ptr + sp.offset, 0, d.m_offset - sp.offset);
+    const auto& sp = head.m_save_stack[--head.m_save_stacksz];
+    auto* region = sp.region;
 
-    d.m_offset = sp.offset;
+    // Abandon anything pushed into regions grown after this save point, so they're
+    // available for the next growth to reuse instead of allocating again.
+    for (auto* r = region->m_next; r; r = r->m_next)
+        r->m_offset = 0;
+
+    // Device storage may not be addressable from the host, so never memset it here.
+    if (region->m_ptr && head.m_clear_on_free && (head.m_type != memory_source::custom) && (region->m_offset > sp.offset))
+        memset(region->m_ptr + sp.offset, 0, region->m_offset - sp.offset);
+
+    region->m_offset = sp.offset;
+    head.m_tail = region;
 #ifndef ENGRAM_DISABLE_TRACKING
-    d.m_count = sp.count;
+    head.m_count = sp.count;
 #endif
 #ifdef ENGRAM_TRACK_TYPE_SIZE
-    d.m_push_depth = sp.push_depth;
+    head.m_push_depth = sp.push_depth;
 #endif
 #ifdef ENGRAM_ENABLE_DIAGNOSTICS
-    d.m_diag_depth = sp.diag_depth;
+    head.m_diag_depth = sp.diag_depth;
 #endif
     return true;
 }
@@ -1339,13 +1549,19 @@ std::size_t arena::save_depth() const noexcept { return m_impl->m_save_stacksz; 
 
 void arena::unpin()
 {
-    auto& d = *m_impl;
-    if (d.m_ptr && (d.m_type == memory_source::heap))
+    auto& head = *m_impl;
+    if (head.m_type != memory_source::heap)
+        return;
+
+    // Pinning applies per region, so every linked region needs its own unlock call.
+    for (auto* r = &head; r; r = r->m_next)
     {
+        if (!r->m_ptr)
+            continue;
 #ifdef __linux__
-        munlock(d.m_ptr, d.m_size);
+        munlock(r->m_ptr, r->m_size);
 #elif _WIN32
-        VirtualUnlock(d.m_ptr, d.m_size);
+        VirtualUnlock(r->m_ptr, r->m_size);
 #endif
     }
 }
@@ -1449,8 +1665,11 @@ bool arena::prefetch_va(std::size_t provided, ...)
         std::size_t size = va_arg(args, std::size_t);
         va_end(args);
 
-        assert(start + size <= d.m_size);
-        ok = engram::prefetch(d.m_ptr + start, size);
+        auto local_start = start;
+        auto* region = locate_region(d, local_start);
+        assert(region && (local_start + size) <= region->m_size &&
+            "engram: prefetch range must land inside a single region of a growable arena");
+        ok = region ? engram::prefetch(region->m_ptr + local_start, size) : false;
     }
 #ifdef ENGRAM_ENABLE_CUDA
     if (d.m_ptr && d.m_is_managed && (d.m_extra == (void*)&vendor::free_cuda))
@@ -1548,10 +1767,16 @@ void arena::warm_cache(cache_locality locality, int32_t ioflags, std::size_t sta
     auto& d = *m_impl;
     if (d.m_ptr && (d.m_type != memory_source::custom))
     {
-        size = (size == 0) ? d.m_size - start : size;
-        assert(start + size <= d.m_size);
+        auto local_start = start;
+        auto* region = locate_region(d, local_start);
+        if (!region)
+            return;
 
-        engram::warm_cache(d.m_ptr + start, size, locality, ioflags);
+        size = (size == 0) ? region->m_size - local_start : size;
+        assert((local_start + size) <= region->m_size &&
+            "engram: warm_cache range must land inside a single region of a growable arena");
+
+        engram::warm_cache(region->m_ptr + local_start, size, locality, ioflags);
     }
 }
 
