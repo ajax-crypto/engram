@@ -120,6 +120,24 @@ bool all_equal(const std::byte* start, std::size_t size, unsigned char value)
     return true;
 }
 
+// Simulates a child function handing a large array back to its caller through a
+// slice the caller already owns: the return value is pushed first, then local
+// scratch is pushed and popped on top of it before returning, so the scratch
+// never has to pop through (and destroy) the result underneath it.
+std::span<int> fill_squares_via_slice(arena& scratch, std::size_t count)
+{
+    auto result = scratch.push_array<int>(count);
+    for (std::size_t i = 0; i < count; ++i)
+        result[i] = static_cast<int>(i * i);
+
+    auto workspace = scratch.push_array<int>(count);
+    for (std::size_t i = 0; i < count; ++i)
+        workspace[i] += result[i];
+    scratch.pop_array(workspace);
+
+    return result;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -791,6 +809,26 @@ TEST(Slice, AvoidFalseSharingWithNoClearKeepsTheExistingBytes)
     auto sub = parent.slice(1024, 512, flags::avoid_false_sharing | flags::no_clear);
 
     CHECK_TRUE(all_equal(parent.data().data() + 1024, 512 + ENGRAM_FALSE_SHARING_PAD, 0xEE));
+}
+
+TEST(Slice, ChildFunctionReturnsALargeArrayThroughASliceToItsParent)
+{
+    auto parent = arena::heap(1 << 20);
+    auto sub = parent.slice(0, 64 * 1024);
+
+    constexpr std::size_t count = 4096;
+    auto values = fill_squares_via_slice(sub, count);
+
+    // The child's own scratch is gone, but its return value survived.
+    UNSIGNED_LONGS_EQUAL(aligned(count * sizeof(int)), sub.used());
+    UNSIGNED_LONGS_EQUAL(count, values.size());
+    for (std::size_t i = 0; i < count; ++i)
+        LONGS_EQUAL((long)(i * i), (long)values[i]);
+
+    // The parent reads the data back through the slice it handed the child.
+    CHECK_TRUE(parent.contains(values.data()));
+    CHECK_TRUE(sub.contains(values.data()));
+    POINTERS_EQUAL(sub.data().data(), values.data());
 }
 
 // ---------------------------------------------------------------------------

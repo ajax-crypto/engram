@@ -7,6 +7,55 @@ source (`.h`/`.cpp`) build, and a **freestanding-only** single header for
 targets with no OS or heap. See
 [Choosing a layout](#choosing-a-layout-single-header-vs-header--source).
 
+## Contents
+
+- [TL;DR](#tldr)
+- [Overview](#overview)
+- [Choosing a layout: single header vs. header + source](#choosing-a-layout-single-header-vs-header--source)
+- [Memory Targets](#memory-targets)
+- [Creating an Arena](#creating-an-arena)
+  - [Byte-count literals](#byte-count-literals)
+  - [Stack arenas](#stack-arenas)
+  - [Flags](#flags)
+  - [Growing an arena](#growing-an-arena)
+- [Using an Arena](#using-an-arena)
+  - [Popping by handle](#popping-by-handle)
+  - [Untyped `pop()`](#untyped-pop)
+  - [Multi-dimensional arrays (`std::mdspan`)](#multi-dimensional-arrays-stdmdspan)
+  - [Introspection Helpers](#introspection-helpers)
+  - [Save & Restore (scoped rewind)](#save--restore-scoped-rewind)
+  - [Slicing (sub-arenas)](#slicing-sub-arenas)
+    - [Returning data through a slice](#returning-data-through-a-slice)
+    - [Partitioning (bulk slicing via callback)](#partitioning-bulk-slicing-via-callback)
+  - [PMR Integration](#pmr-integration)
+  - [Synchronization & Prefetch](#synchronization--prefetch)
+  - [Cache & Page Prefetch (any memory)](#cache--page-prefetch-any-memory)
+  - [Error Handling](#error-handling)
+  - [Creation-site tracking](#creation-site-tracking)
+  - [Diagnostics](#diagnostics)
+- [Optional Backends](#optional-backends)
+  - [Metal (Apple)](#metal-apple)
+    - [metal-cpp private implementation](#metal-cpp-private-implementation)
+  - [OP-TEE (ARM TrustZone)](#op-tee-arm-trustzone)
+  - [Persistent Memory (PMDK)](#persistent-memory-pmdk)
+  - [RDMA](#rdma)
+  - [CUDA GPUDirect Storage](#cuda-gpudirect-storage)
+  - [Linux dma-buf](#linux-dma-buf)
+  - [Overriding Backend Headers](#overriding-backend-headers)
+- [Freestanding single header](#freestanding-single-header)
+  - [`ENGRAM_ENABLE_FSEXTRA`](#engram_enable_fsextra)
+- [Building](#building)
+  - [Build profiles](#build-profiles)
+  - [CMake options](#cmake-options)
+  - [All macros](#all-macros)
+  - [Command line examples](#command-line-examples)
+  - [Large / huge pages (Windows)](#large--huge-pages-windows)
+  - [Locking pages into RAM](#locking-pages-into-ram)
+- [Tests](#tests)
+  - [Vendor conformance (Linux)](#vendor-conformance-linux)
+- [Python bindings](#python-bindings)
+- [License](#license)
+
 ## TL;DR
 
 Grab one block of memory from wherever you need it — the stack, the heap, a
@@ -628,6 +677,43 @@ render(frame.slice(0, 64 * 1024));             // give the callee a 64 KiB slice
 
 > The parent arena must outlive every sub-arena carved from it, since the
 > sub-arena points into the parent's memory.
+
+#### Returning data through a slice
+
+A child function can hand data back to its caller through a slice the caller
+already owns, with no copy and no extra allocation — pass the slice by
+**reference** (the caller keeps using it afterward), push the **return value
+first**, and only then push whatever scratch space the function needs for its
+own bookkeeping. Pop that scratch before returning. Because `pop` always
+rewinds the top of the stack, a result pushed before the scratch can never be
+disturbed by popping the scratch off afterward:
+
+```cpp
+std::span<int> compute(engram::arena& scratch, std::size_t count)
+{
+    auto result = scratch.push_array<int>(count);    // pushed first: outlives this call
+    for (std::size_t i = 0; i < count; ++i)
+        result[i] = static_cast<int>(i * i);
+
+    auto workspace = scratch.push_array<int>(count); // local-only: pushed after the result
+    for (std::size_t i = 0; i < count; ++i)
+        workspace[i] += result[i];
+    scratch.pop_array(workspace);                    // popped before returning — safe, LIFO
+
+    return result;                                   // still points into `scratch`
+}
+
+auto pool  = arena::heap(1 << 20);
+auto slice = pool.slice(0, 64 * 1024);
+
+auto values = compute(slice, 1024);     // the child's own workspace is already gone
+assert(slice.contains(values.data()));  // the parent reads the result back through the slice
+```
+
+> **Push return values before local scratch, always.** Popping is LIFO, so
+> anything pushed *after* the return value can be popped freely without touching
+> it — but pushing scratch first and the return value second would make popping
+> that scratch also pop (and destroy) the return value sitting underneath it.
 
 #### Partitioning (bulk slicing via callback)
 
